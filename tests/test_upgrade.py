@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sys
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -24,6 +25,12 @@ from depfresh.upgrade import (
     derive_label,
     upgrade,
 )
+
+# depfresh.__init__ binds the upgrade() function to the name "upgrade",
+# shadowing the depfresh.upgrade submodule.  On Python <3.12,
+# mock.patch("depfresh.upgrade.X") resolves to the function and fails.
+# Access the real module through sys.modules instead.
+_upgrade_mod = sys.modules["depfresh.upgrade"]
 
 # ---------------------------------------------------------------------------
 # derive_label
@@ -100,20 +107,20 @@ class TestRunAuditWithTemp:
     def test_calls_run_audit_and_returns_vulns(self, tmp_path: Path) -> None:
         vuln = Vulnerability("urllib3", "2.0.0", "CVE-2023-001", "2.0.6", "desc")
         pkgs = {"urllib3": "2.0.0"}
-        with patch("depfresh.upgrade.run_audit", return_value=[vuln]) as mock_audit:
+        with patch.object(_upgrade_mod, "run_audit", return_value=[vuln]) as mock_audit:
             result = _run_audit_with_temp("/venv/bin/python", tmp_path, pkgs, "test")
         assert result == [vuln]
         assert mock_audit.called
 
     def test_temp_file_is_deleted_on_success(self, tmp_path: Path) -> None:
-        with patch("depfresh.upgrade.run_audit", return_value=[]):
+        with patch.object(_upgrade_mod, "run_audit", return_value=[]):
             _run_audit_with_temp("/venv/bin/python", tmp_path, {"flask": "2.3.0"}, "test")
         # Temp file must not remain after successful run
         remaining = list(tmp_path.glob(".depfresh_audit_*.tmp"))
         assert remaining == []
 
     def test_temp_file_is_deleted_on_error(self, tmp_path: Path) -> None:
-        with patch("depfresh.upgrade.run_audit", side_effect=RuntimeError("boom")):
+        with patch.object(_upgrade_mod, "run_audit", side_effect=RuntimeError("boom")):
             with pytest.raises(RuntimeError):
                 _run_audit_with_temp("/venv/bin/python", tmp_path, {"flask": "2.3.0"}, "test")
         remaining = list(tmp_path.glob(".depfresh_audit_*.tmp"))
@@ -127,7 +134,7 @@ class TestRunAuditWithTemp:
             seen_paths.append(req_path)
             return []
 
-        with patch("depfresh.upgrade.run_audit", side_effect=capture_path):
+        with patch.object(_upgrade_mod, "run_audit", side_effect=capture_path):
             _run_audit_with_temp("/venv/bin/python", tmp_path, {"flask": "2.3.0"}, "pre-upgrade")
 
         assert len(seen_paths) == 1
@@ -141,7 +148,7 @@ class TestRunAuditWithTemp:
             seen_paths.append(req_path)
             return []
 
-        with patch("depfresh.upgrade.run_audit", side_effect=capture_path):
+        with patch.object(_upgrade_mod, "run_audit", side_effect=capture_path):
             _run_audit_with_temp("/venv/bin/python", tmp_path, {"flask": "2.3.0"}, "test")
 
         assert len(seen_paths) == 1
@@ -211,17 +218,17 @@ class TestUpgradeHappyPath:
     def test_returns_upgrade_result(self, tmp_path: Path, req_file: Path) -> None:
         setup_mock = _make_setup_venv_mock(tmp_path, old_pkgs={"flask": "2.3.0"})
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[]),
-            patch("depfresh.upgrade.build_constraints", return_value=["flask>=2.3.0,<3"]),
-            patch("depfresh.upgrade.install_packages"),
-            patch("depfresh.upgrade.freeze", return_value={"flask": "2.4.0"}),
-            patch("depfresh.upgrade.verify_imports", return_value=ImportCheck()),
-            patch("depfresh.upgrade.write_log", return_value=tmp_path / "log.txt"),
-            patch("depfresh.upgrade.write_markdown", return_value=tmp_path / "pr.md"),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=["flask>=2.3.0,<3"]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(_upgrade_mod, "freeze", return_value={"flask": "2.4.0"}),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             result = upgrade(tmp_path, label="test", reports_dir=tmp_path)
         assert isinstance(result, UpgradeResult)
@@ -231,17 +238,17 @@ class TestUpgradeHappyPath:
         original_content = req_file.read_text()
         setup_mock = _make_setup_venv_mock(tmp_path, old_pkgs={"flask": "2.3.0"})
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[]),
-            patch("depfresh.upgrade.build_constraints", return_value=[]),
-            patch("depfresh.upgrade.install_packages"),
-            patch("depfresh.upgrade.freeze", return_value={"flask": "2.4.0"}),
-            patch("depfresh.upgrade.verify_imports", return_value=ImportCheck()),
-            patch("depfresh.upgrade.write_log", return_value=tmp_path / "log.txt"),
-            patch("depfresh.upgrade.write_markdown", return_value=tmp_path / "pr.md"),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(_upgrade_mod, "freeze", return_value={"flask": "2.4.0"}),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             upgrade(tmp_path, dry_run=True, label="test", reports_dir=tmp_path)
         assert req_file.read_text() == original_content
@@ -250,17 +257,17 @@ class TestUpgradeHappyPath:
         vuln = Vulnerability("urllib3", "2.0.0", "CVE-2023-001", "2.0.6", "desc")
         setup_mock = _make_setup_venv_mock(tmp_path, old_pkgs={"urllib3": "2.0.0"})
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", side_effect=[[vuln], []]),
-            patch("depfresh.upgrade.build_constraints", return_value=[]),
-            patch("depfresh.upgrade.install_packages"),
-            patch("depfresh.upgrade.freeze", return_value={"urllib3": "2.0.6"}),
-            patch("depfresh.upgrade.verify_imports", return_value=ImportCheck()),
-            patch("depfresh.upgrade.write_log", return_value=tmp_path / "log.txt"),
-            patch("depfresh.upgrade.write_markdown", return_value=tmp_path / "pr.md"),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", side_effect=[[vuln], []]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(_upgrade_mod, "freeze", return_value={"urllib3": "2.0.6"}),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             result = upgrade(tmp_path, label="test", reports_dir=tmp_path)
         assert len(result.pre_audit_vulns) == 1
@@ -270,11 +277,13 @@ class TestUpgradeHappyPath:
         """venv must be cleaned up even when an error occurs inside the try block."""
         setup_mock = _make_setup_venv_mock(tmp_path)
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", side_effect=RuntimeError("audit boom")),
-            patch("depfresh.upgrade.cleanup_venv") as mock_cleanup,
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(
+                _upgrade_mod, "_run_audit_with_temp", side_effect=RuntimeError("audit boom"),
+            ),
+            patch.object(_upgrade_mod, "cleanup_venv") as mock_cleanup,
         ):
             with pytest.raises(RuntimeError, match="audit boom"):
                 upgrade(tmp_path, label="test", reports_dir=tmp_path)
@@ -284,17 +293,17 @@ class TestUpgradeHappyPath:
         vuln = Vulnerability("cryptography", "40.0.0", "CVE-2024-001", "41.0.0", "desc")
         setup_mock = _make_setup_venv_mock(tmp_path)
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", side_effect=[[], [vuln]]),
-            patch("depfresh.upgrade.build_constraints", return_value=[]),
-            patch("depfresh.upgrade.install_packages"),
-            patch("depfresh.upgrade.freeze", return_value={"cryptography": "40.0.0"}),
-            patch("depfresh.upgrade.verify_imports", return_value=ImportCheck()),
-            patch("depfresh.upgrade.write_log", return_value=tmp_path / "log.txt"),
-            patch("depfresh.upgrade.write_markdown", return_value=tmp_path / "pr.md"),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", side_effect=[[], [vuln]]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(_upgrade_mod, "freeze", return_value={"cryptography": "40.0.0"}),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             result = upgrade(tmp_path, label="test", reports_dir=tmp_path)
         assert len(result.post_audit_vulns) == 1
@@ -308,13 +317,13 @@ class TestUpgradeHappyPath:
         error = CommandError(["uv", "pip", "install"], 1, "resolution failed")
 
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[]),
-            patch("depfresh.upgrade.build_constraints", return_value=[]),
-            patch("depfresh.upgrade.install_packages", side_effect=error),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages", side_effect=error),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             with pytest.raises(CommandError, match="resolution failed"):
                 upgrade(tmp_path, label="test", reports_dir=tmp_path)
@@ -331,17 +340,17 @@ class TestUpgradeHappyPath:
         )
         setup_mock = _make_setup_venv_mock(tmp_path, old_pkgs={"flask": "2.3.0"})
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[]),
-            patch("depfresh.upgrade.build_constraints", return_value=[]),
-            patch("depfresh.upgrade.install_packages"),
-            patch("depfresh.upgrade.freeze", return_value={"flask": "2.4.0"}),
-            patch("depfresh.upgrade.verify_imports", return_value=ImportCheck()),
-            patch("depfresh.upgrade.write_log", return_value=tmp_path / "log.txt"),
-            patch("depfresh.upgrade.write_markdown", return_value=tmp_path / "pr.md"),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(_upgrade_mod, "freeze", return_value={"flask": "2.4.0"}),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             upgrade(tmp_path, label="test", reports_dir=tmp_path)
 
@@ -360,17 +369,19 @@ class TestUpgradeHappyPath:
         )
         setup_mock = _make_setup_venv_mock(tmp_path, old_pkgs={"flask": "2.3.0", "pytest": "8.0.0"})
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[]),
-            patch("depfresh.upgrade.build_constraints", return_value=[]),
-            patch("depfresh.upgrade.install_packages"),
-            patch("depfresh.upgrade.freeze", return_value={"flask": "2.4.0", "pytest": "8.1.0"}),
-            patch("depfresh.upgrade.verify_imports", return_value=ImportCheck()),
-            patch("depfresh.upgrade.write_log", return_value=tmp_path / "log.txt"),
-            patch("depfresh.upgrade.write_markdown", return_value=tmp_path / "pr.md"),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(
+                _upgrade_mod, "freeze", return_value={"flask": "2.4.0", "pytest": "8.1.0"},
+            ),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             upgrade(tmp_path, label="test", reports_dir=tmp_path, dependency_scope="all")
 
@@ -387,17 +398,17 @@ class TestUpgradeHappyPath:
         )
         setup_mock = _make_setup_venv_mock(tmp_path, old_pkgs={"flask": "2.3.0"})
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[]),
-            patch("depfresh.upgrade.build_constraints", return_value=[]),
-            patch("depfresh.upgrade.install_packages"),
-            patch("depfresh.upgrade.freeze", return_value={"flask": "2.4.0"}),
-            patch("depfresh.upgrade.verify_imports", return_value=ImportCheck()),
-            patch("depfresh.upgrade.write_log", return_value=tmp_path / "log.txt"),
-            patch("depfresh.upgrade.write_markdown", return_value=tmp_path / "pr.md"),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(_upgrade_mod, "freeze", return_value={"flask": "2.4.0"}),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             result = upgrade(
                 tmp_path,
@@ -431,11 +442,11 @@ class TestAuditOnly:
             return_value=("/venv/bin/python", "3.11.5", "2.7.0", frozenset(), {"flask": "2.3.0"})
         )
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[]),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             result = audit_only(tmp_path)
         assert isinstance(result, UpgradeResult)
@@ -449,11 +460,11 @@ class TestAuditOnly:
             return_value=("/venv/bin/python", "3.11.5", "2.7.0", frozenset(), {"urllib3": "2.0.0"})
         )
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[vuln]),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[vuln]),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             result = audit_only(tmp_path)
         assert len(result.pre_audit_vulns) == 1
@@ -465,11 +476,11 @@ class TestAuditOnly:
             return_value=("/venv/bin/python", "3.11.5", "2.7.0", frozenset(), {"flask": "2.3.0"})
         )
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade._setup_venv", setup_mock),
-            patch("depfresh.upgrade._run_audit_with_temp", side_effect=RuntimeError("boom")),
-            patch("depfresh.upgrade.cleanup_venv") as mock_cleanup,
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", side_effect=RuntimeError("boom")),
+            patch.object(_upgrade_mod, "cleanup_venv") as mock_cleanup,
         ):
             with pytest.raises(RuntimeError):
                 audit_only(tmp_path)
@@ -490,15 +501,15 @@ class TestAuditOnly:
         freeze_mock = MagicMock(return_value={"flask": "2.3.0"})
 
         with (
-            patch("depfresh.upgrade.find_uv", return_value="/usr/bin/uv"),
-            patch("depfresh.upgrade.get_uv_version", return_value="0.4.0"),
-            patch("depfresh.upgrade.create_venv", return_value="/venv/bin/python"),
-            patch("depfresh.upgrade.install_requirements"),
-            patch("depfresh.upgrade.install_pip_audit", return_value=("2.7.0", pip_audit_deps)),
-            patch("depfresh.upgrade.freeze", freeze_mock),
-            patch("depfresh.upgrade.run", return_value=MagicMock(stdout="Python 3.11.5\n")),
-            patch("depfresh.upgrade._run_audit_with_temp", return_value=[]),
-            patch("depfresh.upgrade.cleanup_venv"),
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "create_venv", return_value="/venv/bin/python"),
+            patch.object(_upgrade_mod, "install_requirements"),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=("2.7.0", pip_audit_deps)),
+            patch.object(_upgrade_mod, "freeze", freeze_mock),
+            patch.object(_upgrade_mod, "run", return_value=MagicMock(stdout="Python 3.11.5\n")),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             audit_only(tmp_path)
 
@@ -520,11 +531,13 @@ class TestSetupVenv:
             seen["exists_during_install"] = req_path.exists()
 
         with (
-            patch("depfresh.upgrade.create_venv", return_value="/venv/bin/python"),
-            patch("depfresh.upgrade.install_requirements", side_effect=install_capture),
-            patch("depfresh.upgrade.install_pip_audit", return_value=("2.7.0", frozenset())),
-            patch("depfresh.upgrade.freeze", return_value={"flask": "2.4.0", "requests": "2.32.0"}),
-            patch("depfresh.upgrade.run", return_value=MagicMock(stdout="Python 3.11.5\n")),
+            patch.object(_upgrade_mod, "create_venv", return_value="/venv/bin/python"),
+            patch.object(_upgrade_mod, "install_requirements", side_effect=install_capture),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=("2.7.0", frozenset())),
+            patch.object(
+                _upgrade_mod, "freeze", return_value={"flask": "2.4.0", "requests": "2.32.0"},
+            ),
+            patch.object(_upgrade_mod, "run", return_value=MagicMock(stdout="Python 3.11.5\n")),
         ):
             _setup_venv_result = _setup_venv(
                 "/usr/bin/uv",

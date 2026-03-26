@@ -13,7 +13,7 @@ import tomlkit
 if sys.version_info >= (3, 11):
     import tomllib
 else:
-    import tomli as tomllib
+    import tomli as tomllib  # type: ignore[import-not-found]
 
 from depfresh.constraints import normalise
 from depfresh.models import DependencyInspection, DependencyScope, DependencySpec
