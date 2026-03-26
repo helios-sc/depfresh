@@ -48,9 +48,9 @@ dev = ["pytest", "ruff", "mypy"]
 depfresh = "depfresh.cli:main"
 
 [project.urls]
-Homepage = "https://github.com/helios/depfresh"
-Repository = "https://github.com/helios/depfresh"
-Issues = "https://github.com/helios/depfresh/issues"
+Homepage = "https://github.com/helios-sc/depfresh"
+Repository = "https://github.com/helios-sc/depfresh"
+Issues = "https://github.com/helios-sc/depfresh/issues"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/depfresh"]

@@ -231,7 +231,7 @@ if result.pre_audit_vulns:
 ## Contributing
 
 ```bash
-git clone https://github.com/helios/depfresh.git && cd depfresh
+git clone https://github.com/helios-sc/depfresh.git && cd depfresh
 uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 pytest && ruff check src/ && mypy src/

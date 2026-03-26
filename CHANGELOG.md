@@ -39,5 +39,5 @@ Initial public release.
 - Custom exception hierarchy (`DepfreshError` and subclasses) for clean error handling
 - Exit codes: `0` = clean, `1` = error, `2` = vulnerabilities remain
 
-[Unreleased]: https://github.com/helios/depfresh/compare/v0.1.0...HEAD
-[0.1.0]: https://github.com/helios/depfresh/releases/tag/v0.1.0
+[Unreleased]: https://github.com/helios-sc/depfresh/compare/v0.1.0...HEAD
+[0.1.0]: https://github.com/helios-sc/depfresh/releases/tag/v0.1.0
