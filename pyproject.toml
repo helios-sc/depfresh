@@ -1,0 +1,76 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "depfresh"
+version = "0.1.0"
+description = "Upgrade Python dependencies to their latest safe versions and audit for vulnerabilities."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [
+    { name = "Helios Team", email = "moises.nascimento@helios.sc" },
+]
+keywords = [
+    "dependencies",
+    "upgrade",
+    "vulnerability",
+    "audit",
+    "pip-audit",
+    "uv",
+    "requirements",
+    "security",
+]
+dependencies = [
+    "packaging>=23.0",
+    "tomlkit>=0.12",
+    "tomli>=2.0; python_version < '3.11'",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Build Tools",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Security",
+]
+
+[project.optional-dependencies]
+dev = ["pytest", "ruff", "mypy"]
+
+[project.scripts]
+depfresh = "depfresh.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/helios/depfresh"
+Repository = "https://github.com/helios/depfresh"
+Issues = "https://github.com/helios/depfresh/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/depfresh"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["src"]
+markers = ["smoke: release smoke tests that build the wheel and hit real uv/pip-audit (deselected by default)"]
+addopts = "-m 'not smoke'"
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "UP"]
+
+[tool.mypy]
+python_version = "3.10"
+strict = true
+warn_return_any = true
+warn_unused_configs = true
