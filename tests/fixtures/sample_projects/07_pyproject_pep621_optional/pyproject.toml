@@ -1,0 +1,16 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "test-pep621-optional"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "click>=8.3.1",
+]
+
+[project.optional-dependencies]
+dev = [
+    "packaging>=23.2",
+]
