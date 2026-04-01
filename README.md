@@ -1,7 +1,7 @@
 <picture>
-  <source media="(prefers-color-scheme: dark)" srcset="assets/logo-dark.svg">
-  <source media="(prefers-color-scheme: light)" srcset="assets/logo.svg">
-  <img alt="depfresh" src="assets/logo.svg" width="380">
+  <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/helios-sc/depfresh/refs/heads/main/assets/logo-dark.svg">
+  <source media="(prefers-color-scheme: light)" srcset="https://raw.githubusercontent.com/helios-sc/depfresh/refs/heads/main/assets/logo.svg">
+  <img alt="depfresh" src="https://raw.githubusercontent.com/helios-sc/depfresh/refs/heads/main/assets/logo.svg" width="380">
 </picture>
 
 <br>
