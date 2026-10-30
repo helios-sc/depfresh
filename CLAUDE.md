@@ -113,7 +113,7 @@ Never execute repository code (no `setup.py`, no building local paths) and never
 
 ## Remaining vulnerability diagnostics
 
-In the minimal modes each remaining advisory carries the reason from its fix plan (`advisories.plan_fixes` → `remediation.remaining_reasons`): needs `--allow-major`, kept, no fix released, private index, or the uv error that blocked it. With `--strategy latest`, `diagnose_remaining()` in `constraints.py` classifies each one:
+In the minimal modes each remaining advisory carries the reason from its fix plan (`advisories.plan_fixes` → `remediation.remaining_reasons`): needs `--allow-major`, kept, no fix released, private index, or the uv error that blocked it. Advisories are planned one by one: `FixPlan.open_advisories` holds the ones the target leaves open, each with its own reason, so they never block the package's other fixes. With `--strategy latest`, `diagnose_remaining()` in `constraints.py` classifies each one:
 - **Major upgrade required** — fix crosses a major version boundary (default constraints cap at `<major+1.0`)
 - **Pinned via --keep-version** — user explicitly pinned the package
 - **Major allowed but unresolved** — major was permitted but uv hit a transitive conflict

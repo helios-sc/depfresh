@@ -4,7 +4,10 @@ from __future__ import annotations
 
 from typing import Any
 
-from depfresh.models import UpgradeResult
+from packaging.version import Version
+
+from depfresh.advisories import Release
+from depfresh.models import UpgradeResult, Vulnerability
 
 
 def make_result(**kwargs: Any) -> UpgradeResult:
@@ -26,3 +29,30 @@ def make_result(**kwargs: Any) -> UpgradeResult:
     )
     defaults.update(kwargs)
     return UpgradeResult(**defaults)  # type: ignore[arg-type]
+
+
+class MixedAuditor:
+    """demo has GHSA-aaaa (fixed in 2.0.1) and GHSA-bbbb (no fix released)."""
+
+    def audit(self, pins: dict[str, str], label: str) -> list[Vulnerability]:
+        if "demo" not in pins:
+            return []
+        version = pins["demo"]
+        found = [Vulnerability("demo", version, "GHSA-bbbb", "", "")]
+        if Version(version) < Version("2.0.1"):
+            found.insert(0, Vulnerability("demo", version, "GHSA-aaaa", "2.0.1", ""))
+        return found
+
+
+class MixedSources:
+    def osv_records(self, package: str, version: str) -> list[dict[str, Any]]:
+        def record(vid: str, *events: dict[str, str]) -> dict[str, Any]:
+            return {"id": vid, "affected": [{
+                "package": {"name": "demo", "ecosystem": "PyPI"},
+                "ranges": [{"type": "ECOSYSTEM", "events": [{"introduced": "0"}, *events]}],
+            }]}
+
+        return [record("GHSA-aaaa", {"fixed": "2.0.1"}), record("GHSA-bbbb")]
+
+    def releases(self, package: str) -> list[Release]:
+        return [Release(Version(v)) for v in ("2.0.0", "2.0.1", "2.1.0", "3.0.0")]

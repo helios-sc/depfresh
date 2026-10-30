@@ -432,8 +432,8 @@ def _md_commands(md: list[str], report: UpgradeResult) -> None:
         f"({len(report.pre_audit_vulns)} advisories)."
     )
     md.append(
-        "3. Planned the lowest release that fixes every advisory of each vulnerable package "
-        "(OSV affected ranges, PyPI releases)."
+        "3. Planned, for each vulnerable package, the lowest release that fixes every advisory "
+        "that has a fix (OSV affected ranges, PyPI releases)."
     )
     md.append("4. Applied the plan:")
     md.append("")

@@ -204,7 +204,7 @@ def planned_fixes(
     plans: Mapping[str, FixPlan],
     final: Mapping[str, str],
     failures: Mapping[str, str],
-    still_vulnerable: set[str],
+    remaining: Iterable[Vulnerability],
     *,
     applied: bool,
 ) -> list[PlannedFix]:
@@ -214,9 +214,16 @@ def planned_fixes(
         plans: Every plan made during the run (last plan per package wins).
         final: ``{name: version}`` after remediation.
         failures: ``{name: reason}`` for fixes uv could not apply.
-        still_vulnerable: Packages that still have findings afterwards.
+        remaining: The findings left afterwards.  A fix counts as applied when
+            only the advisories its plan left open remain.
         applied: False for dry runs and audit-only runs.
     """
+    unexpected: set[str] = set()
+    for v in remaining:
+        name = normalise(v.package)
+        known = plans[name].open_advisories if name in plans else {}
+        if not any(i in known for i in v.ids):
+            unexpected.add(name)
     rows: list[PlannedFix] = []
     for name, p in sorted(plans.items()):
         status: str = p.status
@@ -226,7 +233,7 @@ def planned_fixes(
                 status, reason = "blocked", failures[name]
             elif not applied:
                 status = "planned"
-            elif name in still_vulnerable:
+            elif name in unexpected:
                 status = "blocked"
                 reason = f"Moved to {final.get(name)}, still vulnerable; see remaining findings"
             else:
@@ -240,6 +247,7 @@ def planned_fixes(
             reason=reason + (" (approximate: OSV/PyPI unavailable)" if p.approximate else ""),
             advisories=sorted({v.ghsa or v.cve for v in p.vulns}),
             final=final.get(name),
+            open_advisories=dict(p.open_advisories),
         ))
     return rows
 
@@ -249,13 +257,14 @@ def remaining_reasons(
     fixes: list[PlannedFix],
     explain: Callable[[str], str] | None = None,
 ) -> list[str]:
-    """One reason per remaining finding, from the plan of its package."""
+    """One reason per remaining finding: its own when its plan left it open."""
     by_name = {f.package: f for f in fixes}
     reasons: list[str] = []
     for v in post_vulns:
         fix = by_name.get(normalise(v.package))
         if fix is not None:
-            reasons.append(fix.reason)
+            own = next((fix.open_advisories[i] for i in v.ids if i in fix.open_advisories), None)
+            reasons.append(own if own is not None else fix.reason)
         elif explain is not None:
             reasons.append(explain(normalise(v.package)))
         else:

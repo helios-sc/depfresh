@@ -763,12 +763,11 @@ def _lock_result(
 ) -> UpgradeResult:
     """Build the :class:`UpgradeResult` of a lock-aware run (nothing written yet)."""
     vulnerable = {normalise(v.package) for v in outcome.pre_vulns}
-    still = {normalise(v.package) for v in outcome.post_vulns}
     changed, added, unchanged, removed = diff_sets(
         outcome.baseline.pins, outcome.final.pins, vulnerable,
     )
     fixes = planned_fixes(
-        outcome.plans, outcome.final.pins, outcome.failures, still,
+        outcome.plans, outcome.final.pins, outcome.failures, outcome.post_vulns,
         applied=not (options.dry_run or audit_only_run),
     )
     files = (["uv.lock"] if outcome.new_lock else []) + (
@@ -932,10 +931,9 @@ def _pip_result(
     audit_only_run: bool,
 ) -> UpgradeResult:
     """Build the :class:`UpgradeResult` of a resolved-mode run (nothing written yet)."""
-    still = {normalise(v.package) for v in outcome.post_vulns}
     changed, added, unchanged, removed = changes_of(outcome)
     fixes = planned_fixes(
-        outcome.plans, outcome.final.pins, outcome.failures, still,
+        outcome.plans, outcome.final.pins, outcome.failures, outcome.post_vulns,
         applied=not (options.dry_run or audit_only_run),
     )
     diff = ""
@@ -1181,7 +1179,8 @@ def upgrade(
 
     This is the primary public API.  With the default ``strategy="minimal"``
     only vulnerable packages move, each to the lowest release that fixes all
-    of its advisories:
+    of its advisories that have a fix (the others stay open, each with its
+    own reason):
 
     * **uv projects** (``pyproject.toml`` next to ``uv.lock``): the locked set
       is exported and audited, fixed with ``uv lock --upgrade-package

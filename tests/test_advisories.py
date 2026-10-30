@@ -267,6 +267,133 @@ class TestPlanFixes:
         assert plan.approximate is True
 
 
+def _open_range(vid: str, package: str, *events: dict[str, str],
+                aliases: list[str] | None = None) -> dict[str, Any]:
+    return _record(vid, package, [{"introduced": "0"}, *events], aliases=aliases)
+
+
+class TestMixedFixes:
+    """Each advisory is judged on its own: one without a fix never blocks the others."""
+
+    RELEASES = {"demo": ["2.0.0", "2.0.1", "2.1.0", "3.0.0"]}
+    VULNS = [_vuln("demo", "2.0.0", "GHSA-aaaa", "2.0.1"), _vuln("demo", "2.0.0", "GHSA-bbbb")]
+
+    def _plan(self, *records: dict[str, Any], vulns: list[Vulnerability] | None = None,
+              **kwargs: Any) -> Any:
+        sources = FakeSources(records={"demo": list(records)}, releases=self.RELEASES)
+        return plan_fixes(vulns or self.VULNS, {"demo": "2.0.0"}, env=ENV, sources=sources,
+                          **kwargs)["demo"]
+
+    def test_fixes_what_it_can_when_another_advisory_has_no_fix(self) -> None:
+        plan = self._plan(_open_range("GHSA-aaaa", "demo", {"fixed": "2.0.1"}),
+                          _open_range("GHSA-bbbb", "demo"))
+        assert (plan.status, plan.target, plan.lowest_fix) == ("fix", "2.0.1", "2.0.1")
+        assert plan.open_advisories == {"GHSA-bbbb": "No fixed release available yet"}
+        assert "fixes 1 of 2 advisories; still open: GHSA-bbbb" in plan.reason
+
+    def test_a_fix_in_a_later_major_does_not_block_the_in_major_fix(self) -> None:
+        records = (_open_range("GHSA-aaaa", "demo", {"fixed": "2.0.1"}),
+                   _open_range("GHSA-bbbb", "demo", {"fixed": "3.0.0"}))
+        plan = self._plan(*records)
+        assert (plan.status, plan.target, plan.lowest_fix) == ("fix", "2.0.1", "3.0.0")
+        assert plan.open_advisories["GHSA-bbbb"] == (
+            "Requires major upgrade (2→3, lowest fix 3.0.0). Use --allow-major demo"
+        )
+        allowed = self._plan(*records, allow_major=["demo"])
+        assert (allowed.status, allowed.target, allowed.open_advisories) == ("fix", "3.0.0", {})
+        assert "MAJOR 2→3" in allowed.reason
+
+    def test_needs_major_while_another_advisory_has_no_fix(self) -> None:
+        plan = self._plan(_open_range("GHSA-aaaa", "demo", {"fixed": "3.0.0"}),
+                          _open_range("GHSA-bbbb", "demo"))
+        assert (plan.status, plan.target, plan.lowest_fix) == ("needs-major", None, "3.0.0")
+        assert plan.reason.endswith("Use --allow-major demo; still open after it: GHSA-bbbb")
+        assert plan.open_advisories == {
+            "GHSA-aaaa": "Requires major upgrade (2→3, lowest fix 3.0.0). Use --allow-major demo",
+            "GHSA-bbbb": "No fixed release available yet",
+        }
+
+    def test_no_advisory_has_a_fix(self) -> None:
+        plan = self._plan(_open_range("GHSA-aaaa", "demo"), _open_range("GHSA-bbbb", "demo"))
+        assert (plan.status, plan.target, plan.lowest_fix) == ("no-fix", None, None)
+        assert set(plan.open_advisories) == {"GHSA-aaaa", "GHSA-bbbb"}
+
+    def test_advisories_no_single_release_fixes_together(self) -> None:
+        """GHSA-aaaa comes back in 2.1.0, the first release without GHSA-bbbb."""
+        plan = self._plan(
+            _open_range("GHSA-aaaa", "demo", {"fixed": "2.0.1"}, {"introduced": "2.1.0"}),
+            _open_range("GHSA-bbbb", "demo", {"fixed": "2.1.0"}),
+        )
+        assert (plan.status, plan.target) == ("fix", "2.0.1")
+        assert "affected by another advisory of demo" in plan.open_advisories["GHSA-bbbb"]
+
+    def test_the_most_advisories_win_over_the_lowest_release(self) -> None:
+        plan = self._plan(
+            _open_range("GHSA-aaaa", "demo", {"fixed": "2.0.1"}),
+            _open_range("GHSA-bbbb", "demo", {"fixed": "2.1.0"}),
+            vulns=[*self.VULNS, _vuln("demo", "2.0.0", "GHSA-cccc")],
+        )
+        assert (plan.target, list(plan.open_advisories)) == ("2.1.0", ["GHSA-cccc"])
+
+    def test_open_advisories_are_keyed_by_every_alias(self) -> None:
+        vulns = [self.VULNS[0], _vuln("demo", "2.0.0", "CVE-2026-1", "", ("GHSA-bbbb",))]
+        plan = self._plan(_open_range("GHSA-aaaa", "demo", {"fixed": "2.0.1"}),
+                          _open_range("GHSA-bbbb", "demo", aliases=["CVE-2026-1"]), vulns=vulns)
+        assert set(plan.open_advisories) == {"CVE-2026-1", "GHSA-bbbb"}
+
+
+class TestOpenAdvisoryRows:
+    """How a plan's open advisories reach the report rows and remaining reasons."""
+
+    @staticmethod
+    def _mixed() -> dict[str, Any]:
+        sources = FakeSources(
+            records={"demo": [_open_range("GHSA-aaaa", "demo", {"fixed": "2.0.1"}),
+                              _open_range("GHSA-bbbb", "demo")]},
+            releases=TestMixedFixes.RELEASES,
+        )
+        return plan_fixes(TestMixedFixes.VULNS, {"demo": "2.0.0"}, env=ENV, sources=sources)
+
+    def test_only_the_open_advisory_remains_so_the_fix_is_applied(self) -> None:
+        from depfresh.remediation import planned_fixes, remaining_reasons
+
+        left = [_vuln("demo", "2.0.1", "GHSA-bbbb")]
+        rows = planned_fixes(self._mixed(), {"demo": "2.0.1"}, {}, left, applied=True)
+        assert [(r.status, r.target, r.final) for r in rows] == [("applied", "2.0.1", "2.0.1")]
+        assert remaining_reasons(left, rows) == ["No fixed release available yet"]
+
+    def test_an_advisory_the_target_should_fix_still_blocks(self) -> None:
+        from depfresh.remediation import planned_fixes, remaining_reasons
+
+        left = [_vuln("demo", "2.0.1", "GHSA-aaaa"), _vuln("demo", "2.0.1", "GHSA-bbbb")]
+        rows = planned_fixes(self._mixed(), {"demo": "2.0.1"}, {}, left, applied=True)
+        assert rows[0].status == "blocked"
+        assert remaining_reasons(left, rows) == [
+            "Moved to 2.0.1, still vulnerable; see remaining findings",
+            "No fixed release available yet",
+        ]
+
+    def test_a_failed_fix_keeps_each_advisory_reason(self) -> None:
+        from depfresh.remediation import planned_fixes, remaining_reasons
+
+        left = list(TestMixedFixes.VULNS)
+        rows = planned_fixes(self._mixed(), {"demo": "2.0.0"}, {"demo": "uv could not lock it"},
+                             left, applied=True)
+        assert rows[0].status == "blocked"
+        assert remaining_reasons(left, rows) == ["uv could not lock it",
+                                                 "No fixed release available yet"]
+
+    def test_audit_only_rows_are_planned_with_a_reason_per_advisory(self) -> None:
+        from depfresh.remediation import planned_fixes, remaining_reasons
+
+        left = list(TestMixedFixes.VULNS)
+        rows = planned_fixes(self._mixed(), {"demo": "2.0.0"}, {}, left, applied=False)
+        assert rows[0].status == "planned"
+        reasons = remaining_reasons(left, rows)
+        assert reasons[0].startswith("Upgrade to 2.0.1")
+        assert reasons[1] == "No fixed release available yet"
+
+
 class TestTargetEnv:
     def test_linux_markers(self) -> None:
         env = TargetEnv("3.11")

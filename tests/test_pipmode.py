@@ -32,6 +32,7 @@ from depfresh.pipmode import (
 )
 from depfresh.remediation import RemediationOptions
 from depfresh.reqlines import parse_lines
+from tests.helpers import MixedAuditor, MixedSources
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -323,6 +324,8 @@ def _remediate(
     *,
     fmt: DependencyFormat = DependencyFormat.REQUIREMENTS_SIMPLE,
     name: str = "requirements.txt",
+    auditor: Any = None,
+    sources: Any = None,
     **option_kwargs: Any,
 ) -> Any:
     target = tmp_path / "proj"
@@ -333,13 +336,23 @@ def _remediate(
     with patch.object(PipWorkspace, "compile", autospec=True, side_effect=resolver):
         return remediate_pip(
             uv="/usr/bin/uv", target_dir=target, manifest=manifest, fmt=fmt,
-            work_dir=tmp_path / "work", auditor=FakeAuditor(vulnerable),  # type: ignore[arg-type]
-            options=options, sources=FakeSources(fixes, resolver.universe),
+            work_dir=tmp_path / "work", auditor=auditor or FakeAuditor(vulnerable),
+            options=options, sources=sources or FakeSources(fixes, resolver.universe),
             venv_name=".venv-upgrade", ignore_direct_references=False,
         )
 
 
 class TestRemediatePip:
+    def test_an_advisory_without_a_fix_does_not_block_the_other(self, tmp_path: Path) -> None:
+        resolver = FakeResolver({"demo": ["2.0.0", "2.0.1", "2.1.0", "3.0.0"]}, {})
+        outcome = _remediate(tmp_path, "demo==2.0.0\n", resolver, {}, {},
+                             auditor=MixedAuditor(), sources=MixedSources())
+        assert outcome.new_text == "demo==2.0.1\n"
+        assert [v.cve for v in outcome.post_vulns] == ["GHSA-bbbb"]
+        plan = outcome.plans["demo"]
+        assert (plan.status, plan.target) == ("fix", "2.0.1")
+        assert plan.open_advisories == {"GHSA-bbbb": "No fixed release available yet"}
+
     def test_floor_is_not_read_as_the_shipped_version(self, tmp_path: Path) -> None:
         """google-cloud-storage>=2.10.0 ships 3.17.1 and must stay there."""
         resolver = FakeResolver(

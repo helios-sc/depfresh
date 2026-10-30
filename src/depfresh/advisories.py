@@ -400,13 +400,20 @@ class FixPlan:
             crosses a major version and that is not allowed), ``"kept"``
             (``--keep-version``), ``"no-fix"`` or ``"private"`` (from a
             non-PyPI index, not looked up).
-        target: The release to move to when *status* is ``"fix"``.
-        lowest_fix: The lowest release clear of every advisory, any major.
+        target: The release to move to when *status* is ``"fix"``: the lowest
+            allowed release that fixes as many advisories as any allowed
+            release does (every advisory when one release fixes them all).
+        lowest_fix: The same choice with every major allowed.
         kind: :func:`~depfresh.constraints.classify_bump` of current → target
             (or → *lowest_fix* when no target).
         reason: Human-readable explanation for reports.
         approximate: True when the plan fell back to pip-audit's fix versions
             because OSV or PyPI could not be read.
+        open_advisories: The advisories *target* leaves open (every advisory
+            when there is no target), keyed by each of their ids, with why:
+            no fixed release yet, the fix needs a major, or no release fixes
+            them together with the others.  Empty for ``"kept"`` and
+            ``"private"`` plans, whose *reason* covers every advisory.
     """
 
     package: str
@@ -418,6 +425,7 @@ class FixPlan:
     kind: str = ""
     reason: str = ""
     approximate: bool = False
+    open_advisories: dict[str, str] = field(default_factory=dict)
 
 
 def major_allowed(package: str, allow_major: list[str] | None) -> bool:
@@ -493,7 +501,14 @@ def _plan_versions(
     sources: AdvisorySources,
     allow_major: list[str] | None,
 ) -> None:
-    """Fill *plan*'s target/lowest_fix/status from OSV ranges and PyPI releases."""
+    """Fill *plan*'s target/lowest_fix/status from OSV ranges and PyPI releases.
+
+    Each advisory is judged on its own, so an advisory without a fixed
+    release, or one fixed only in a later major, never holds back the fixes
+    that exist: the target is the lowest allowed release that fixes as many
+    advisories as any allowed release does, and the others are listed in
+    :attr:`FixPlan.open_advisories` with their own reason.
+    """
     current = _parse_version(plan.current)
     if current is None:
         plan.reason = f"Cannot parse the current version {plan.current!r}"
@@ -511,14 +526,11 @@ def _plan_versions(
     if any(not recs for recs in advisory_records):
         plan.approximate = plan.approximate or bool(records)
 
-    def affected(version: Version) -> bool:
-        for vuln, recs in zip(plan.vulns, advisory_records):
-            if recs:
-                if any(record_affects(r, plan.package, version) for r in recs):
-                    return True
-            elif _affected_by_fix_versions(vuln, current, version):
-                return True
-        return False
+    def affected(index: int, version: Version) -> bool:
+        recs = advisory_records[index]
+        if recs:
+            return any(record_affects(r, plan.package, version) for r in recs)
+        return _affected_by_fix_versions(plan.vulns[index], current, version)
 
     try:
         releases = [r for r in sources.releases(plan.package) if not r.yanked]
@@ -528,39 +540,77 @@ def _plan_versions(
         plan.approximate = True
         releases = [Release(v) for v in _advisory_fix_versions(plan, records)]
 
-    candidates = [
+    candidates = sorted(
         r.version for r in releases
         if r.version > current
         and (current.is_prerelease or not r.version.is_prerelease)
         and r.supports(env)
-    ]
-    # Candidates ascend, so the first unaffected one is the lowest fix; and if
-    # it is already past the current major, every in-major release is affected.
-    lowest = next((c for c in candidates if not affected(c)), None)
-    same_major = lowest if lowest is not None and _same_major(current, lowest) else None
-
+    )
+    cleared = {
+        c: frozenset(i for i in range(len(plan.vulns)) if not affected(i, c)) for c in candidates
+    }
+    may_cross = major_allowed(plan.package, allow_major)
+    allowed = [c for c in candidates if may_cross or _same_major(current, c)]
+    lowest = _fixes_most(candidates, cleared)
+    target = _fixes_most(allowed, cleared)
     plan.lowest_fix = str(lowest) if lowest else None
-    if same_major is not None:
-        plan.status, plan.target = "fix", str(same_major)
-        plan.kind = classify_bump(plan.current, plan.target)
-        plan.reason = f"Upgrade to {plan.target}, the lowest release that fixes every advisory"
-    elif lowest is not None:
-        plan.kind = classify_bump(plan.current, str(lowest))
-        if major_allowed(plan.package, allow_major):
-            plan.status, plan.target = "fix", str(lowest)
-            plan.reason = (
-                f"Upgrade to {plan.target} (MAJOR {current.major}→{lowest.major}, "
-                "allowed by --allow-major): no fix exists in the current major"
-            )
+
+    fixed = cleared[target] if target is not None else frozenset()
+    left: list[Vulnerability] = []
+    for index, vuln in enumerate(plan.vulns):
+        if index in fixed:
+            continue
+        left.append(vuln)
+        first_fix = next((c for c in candidates if index in cleared[c]), None)
+        if first_fix is None:
+            why = "No fixed release available yet"
+        elif not any(index in cleared[c] for c in allowed):
+            why = (f"Requires major upgrade ({current.major}→{first_fix.major}, lowest fix "
+                   f"{first_fix}). Use --allow-major {plan.package}")
         else:
-            plan.status = "needs-major"
-            plan.reason = (
-                f"Requires major upgrade ({current.major}→{lowest.major}, lowest fix "
-                f"{lowest}). Use --allow-major {plan.package}"
-            )
+            why = (f"Every release that fixes it is affected by another advisory of "
+                   f"{plan.package}; {target} fixes the most of them")
+        for vid in vuln.ids:
+            plan.open_advisories[vid] = why
+    still_open = ", ".join(sorted({v.ghsa or v.cve for v in left}))
+
+    if target is not None:
+        plan.status, plan.target = "fix", str(target)
+        plan.kind = classify_bump(plan.current, plan.target)
+        crossing = not _same_major(current, target)
+        lead = f"Upgrade to {plan.target}"
+        if crossing:
+            lead += f" (MAJOR {current.major}→{target.major}, allowed by --allow-major)"
+        if not left:
+            plan.reason = lead + (": no release in the current major fixes every advisory"
+                                  if crossing else ", the lowest release that fixes every advisory")
+        else:
+            plan.reason = (f"{lead}, the lowest release that fixes {len(fixed)} of "
+                           f"{len(plan.vulns)} advisories; still open: {still_open}")
+    elif lowest is not None:
+        plan.status = "needs-major"
+        plan.kind = classify_bump(plan.current, str(lowest))
+        plan.reason = (
+            f"Requires major upgrade ({current.major}→{lowest.major}, lowest fix "
+            f"{lowest}). Use --allow-major {plan.package}"
+        )
+        if len(cleared[lowest]) < len(plan.vulns):
+            unfixed = sorted({v.ghsa or v.cve for i, v in enumerate(plan.vulns)
+                              if i not in cleared[lowest]})
+            plan.reason += f"; still open after it: {', '.join(unfixed)}"
     else:
         plan.status = "no-fix"
         plan.reason = "No fixed release available yet"
+
+
+def _fixes_most(
+    candidates: list[Version], cleared: Mapping[Version, frozenset[int]],
+) -> Version | None:
+    """The lowest of ascending *candidates* fixing the most advisories (None: none fixes any)."""
+    most = max((len(cleared[c]) for c in candidates), default=0)
+    if most == 0:
+        return None
+    return next(c for c in candidates if len(cleared[c]) == most)
 
 
 def _same_major(current: Version, candidate: Version) -> bool:

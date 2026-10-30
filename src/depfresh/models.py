@@ -101,6 +101,8 @@ class PlannedFix:
         reason: Human-readable explanation.
         advisories: Display ids of the advisories involved.
         final: Version shipped after remediation.
+        open_advisories: ``{advisory id: reason}`` for the advisories the plan
+            leaves open (see :attr:`depfresh.advisories.FixPlan.open_advisories`).
     """
 
     package: str
@@ -111,6 +113,7 @@ class PlannedFix:
     reason: str = ""
     advisories: list[str] = field(default_factory=list)
     final: str | None = None
+    open_advisories: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass

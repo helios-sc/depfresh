@@ -41,7 +41,7 @@ depfresh /path/to/project
          ▼
    audit (pip-audit --no-deps --disable-pip -s osv, advisories deduplicated)
          │
-   plan: lowest release fixing every advisory (OSV ranges + PyPI releases)
+   plan: lowest release fixing every fixable advisory (OSV ranges + PyPI releases)
          │
    apply ─── uv.lock:    uv lock --upgrade-package <pkg>==<fix>
          │└── otherwise:  edit only the affected lines, then resolve again
@@ -58,7 +58,7 @@ If resolution fails, an audit returns invalid output, or imports regress, depfre
 | | |
 |---|---|
 | **Audits what ships** | The locked set of uv projects, or a resolution for the deploy platform (default `x86_64-unknown-linux-gnu`) |
-| **Minimal fixes** | Only vulnerable packages move, each to the lowest release that fixes all of its advisories |
+| **Minimal fixes** | Only vulnerable packages move, each to the lowest release that fixes all of its advisories that have a fix |
 | **Lock-aware** | Fixes `uv.lock` with `uv lock --upgrade-package`; `pyproject.toml` floors stay unless they block a fix |
 | **Format-preserving** | Edits only the affected requirement lines; comments, markers, floors and order stay |
 | **Safe majors** | A fix that crosses a major version needs `--allow-major <pkg>`, and is flagged in the report |
@@ -153,10 +153,11 @@ A floor is never read as the version that ships: `google-cloud-storage>=2.10.0` 
 
 ### Minimal upgrades
 
-For each vulnerable package depfresh reads the full OSV records of its advisories (pip-audit keeps only the last affected range, so it reports fastmcp 3.4.2 → 4.1.2 although 3.4.10 fixes it) and walks its PyPI releases upwards, skipping yanked, pre-release and `Requires-Python`-incompatible ones. The target is the lowest release no advisory affects:
+For each vulnerable package depfresh reads the full OSV records of its advisories (pip-audit keeps only the last affected range, so it reports fastmcp 3.4.2 → 4.1.2 although 3.4.10 fixes it) and walks its PyPI releases upwards, skipping yanked, pre-release and `Requires-Python`-incompatible ones. Each advisory is judged on its own, and the target is the lowest release that fixes every advisory a release fixes:
 
 - in the current major when one exists; calendar versions (certifi, tzdata) never count as a major;
 - otherwise the package needs `--allow-major <pkg>`; without it the advisory stays open and the report says "Requires major upgrade (46→50). Use --allow-major cryptography";
+- an advisory with no fixed release, or one fixed only in a later major, stays open with its own reason and does not hold back the package's other fixes; when no single release fixes them all, the lowest release that fixes the most of them wins;
 - co-upgrades that cross a major are refused unless `--allow-major` covers them.
 
 Advisories are counted once: OSV's GHSA and PYSEC records of the same issue are merged by alias.

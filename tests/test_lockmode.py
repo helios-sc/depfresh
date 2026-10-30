@@ -29,6 +29,7 @@ from depfresh.lockmode import (
 from depfresh.models import ImportCheck, UpgradeResult, Vulnerability
 from depfresh.remediation import RemediationOptions
 from depfresh.upgrade import upgrade
+from tests.helpers import MixedAuditor, MixedSources
 
 _upgrade_mod = sys.modules["depfresh.upgrade"]
 
@@ -467,6 +468,19 @@ class TestRemediateLock:
         assert outcome.final.pins == self.BASE
         assert "--allow-major aiohttp six" in outcome.failures["aiohttp"]
 
+    def test_an_advisory_without_a_fix_does_not_block_the_other(self, tmp_path: Path) -> None:
+        pyproject = '[project]\nname = "x"\ndependencies = ["demo>=2"]\n'
+        outcome, project = _run(
+            tmp_path, lambda root: FakeProject(root, {"demo": "2.0.0"}, {}, pyproject),
+            MixedAuditor(), MixedSources(),  # type: ignore[arg-type]
+        )
+        assert project.lock_calls == [{"demo": "2.0.1"}]
+        assert outcome.final.pins == {"demo": "2.0.1"}
+        assert [v.cve for v in outcome.post_vulns] == ["GHSA-bbbb"]
+        assert outcome.plans["demo"].open_advisories == {
+            "GHSA-bbbb": "No fixed release available yet",
+        }
+
     def test_follow_up_round_for_a_vulnerable_co_upgrade(self, tmp_path: Path) -> None:
         auditor = FakeAuditor({"aiohttp": {"3.14.1"}, "yarl": {"1.24.9"}})
         sources = FakeSources({"aiohttp": "3.14.4", "yarl": "1.25.1"},
@@ -524,6 +538,22 @@ class TestUpgradeLockMode:
             result = upgrade(project, label="x", reports_dir=tmp_path / "reports", **kwargs)
         assert mock.called
         return result
+
+    @pytest.mark.parametrize("dry_run", [False, True])
+    def test_an_open_advisory_keeps_its_own_reason(self, tmp_path: Path, dry_run: bool) -> None:
+        from depfresh.advisories import FixPlan
+
+        outcome = self._outcome(tmp_path)
+        outcome.pre_vulns.append(Vulnerability("fastmcp", "3.4.2", "GHSA-open", "", ""))
+        outcome.post_vulns = [Vulnerability("fastmcp", "3.4.10", "GHSA-open", "", "")]
+        outcome.plans = {"fastmcp": FixPlan(
+            "fastmcp", "3.4.2", list(outcome.pre_vulns), status="fix", target="3.4.10",
+            kind="patch", reason="Upgrade to 3.4.10; still open: GHSA-open",
+            open_advisories={"GHSA-open": "No fixed release available yet"},
+        )}
+        result = self._upgrade(tmp_path, outcome, python="3.12", dry_run=dry_run)
+        assert [f.status for f in result.fixes] == ["planned" if dry_run else "applied"]
+        assert result.remaining_reasons == ["No fixed release available yet"]
 
     def test_writes_the_lock(self, tmp_path: Path) -> None:
         result = self._upgrade(tmp_path, self._outcome(tmp_path), python="3.12")
