@@ -19,6 +19,8 @@ import json
 import logging
 from pathlib import Path
 
+from packaging.version import InvalidVersion, Version
+
 from depfresh.exceptions import AuditError
 from depfresh.models import Vulnerability
 from depfresh.uv import create_venv, run
@@ -160,7 +162,14 @@ def _parse_pip_audit_json(output: str) -> list[Vulnerability]:
 
 
 def _parse_pip_audit_data(data: object) -> list[Vulnerability]:
-    """Parse decoded pip-audit JSON data."""
+    """Parse decoded pip-audit JSON data, merging aliased duplicates.
+
+    pip-audit reports one entry per OSV record, and OSV frequently holds the
+    same advisory twice (``GHSA-…`` and ``PYSEC-…`` records that list each
+    other, or the CVE, as aliases).  Records of one package whose id/alias
+    sets overlap are merged into a single :class:`Vulnerability`, so each
+    advisory is counted once.
+    """
 
     # pip-audit --format json wraps the list in {"dependencies": [...], "fixes": [...]}
     if isinstance(data, dict):
@@ -176,21 +185,65 @@ def _parse_pip_audit_data(data: object) -> list[Vulnerability]:
             continue
         name: str = pkg.get("name", "")
         version: str = pkg.get("version", "")
-        for v in pkg.get("vulns", []):
-            if not isinstance(v, dict):
-                continue
-            # Prefer a CVE alias over the primary PYSEC/GHSA id when available
-            aliases: list[str] = v.get("aliases", [])
-            vid: str = next((a for a in aliases if a.startswith("CVE-")), v.get("id", ""))
-            fix_versions: str = ", ".join(v.get("fix_versions", []))
-            desc: str = v.get("description", "")
-            if len(desc) > 120:
-                desc = desc[:120] + "..."
-            vulns.append(Vulnerability(
-                package=name,
-                version=version,
-                cve=vid,
-                fix_versions=fix_versions,
-                description=desc,
-            ))
+        records = [v for v in pkg.get("vulns", []) if isinstance(v, dict)]
+        vulns.extend(_merge_aliased_records(name, version, records))
     return vulns
+
+
+def _merge_aliased_records(
+    name: str, version: str, records: list[dict[str, object]],
+) -> list[Vulnerability]:
+    """Group *records* whose ids or aliases overlap and build one entry per group."""
+    groups: list[tuple[list[str], set[str], list[dict[str, object]]]] = []
+    for record in records:
+        primary = str(record.get("id", ""))
+        raw_aliases = record.get("aliases") or []
+        aliases = [str(a) for a in raw_aliases] if isinstance(raw_aliases, list) else []
+        ids = {i for i in [primary, *aliases] if i}
+        overlapping = [g for g in groups if g[1] & ids]
+        if overlapping:
+            target = overlapping[0]
+            for other in overlapping[1:]:  # this record links two groups
+                target[0].extend(i for i in other[0] if i not in target[0])
+                target[1].update(other[1])
+                target[2].extend(other[2])
+                groups.remove(other)
+        else:
+            target = ([], set(), [])
+            groups.append(target)
+        if primary and primary not in target[0]:
+            target[0].append(primary)
+        target[1].update(ids)
+        target[2].append(record)
+
+    merged: list[Vulnerability] = []
+    for primaries, ids, group_records in groups:
+        cves = sorted(i for i in ids if i.startswith("CVE-"))
+        display = cves[0] if cves else (primaries[0] if primaries else sorted(ids)[0])
+        fixes: set[str] = set()
+        description = ""
+        for record in group_records:
+            raw_fixes = record.get("fix_versions") or []
+            if isinstance(raw_fixes, list):
+                fixes.update(str(f) for f in raw_fixes)
+            if not description:
+                description = str(record.get("description") or "")
+        if len(description) > 120:
+            description = description[:120] + "..."
+        merged.append(Vulnerability(
+            package=name,
+            version=version,
+            cve=display,
+            fix_versions=", ".join(sorted(fixes, key=_version_sort_key)),
+            description=description,
+            aliases=tuple(sorted(ids - {display})),
+        ))
+    return merged
+
+
+def _version_sort_key(value: str) -> tuple[int, Version | str]:
+    """Sort PEP 440 versions numerically, anything else after them as text."""
+    try:
+        return (0, Version(value))
+    except InvalidVersion:
+        return (1, value)

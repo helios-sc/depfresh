@@ -123,6 +123,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Directory for report output (default: ./reports/)",
     )
     parser.add_argument(
+        "--uv", default=None, dest="uv_binary", metavar="PATH",
+        help=(
+            "uv binary to use (default: $DEPFRESH_UV, then a uv in depfresh's own "
+            "environment, then PATH; it must be at least the supported minimum)"
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable debug output",
     )
@@ -144,6 +151,7 @@ def main(argv: list[str] | None = None) -> None:
             allow_major=args.allow_major,
             keep_version=args.keep_version,
             reports_dir=args.reports_dir,
+            uv_binary=args.uv_binary,
         )
     except DepfreshError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

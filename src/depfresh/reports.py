@@ -5,7 +5,12 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 
-from depfresh.constraints import format_allow_major, format_keep_version, normalise
+from depfresh.constraints import (
+    classify_bump,
+    format_allow_major,
+    format_keep_version,
+    normalise,
+)
 from depfresh.models import UpgradeResult
 from depfresh.uv import compile_hashed
 
@@ -197,6 +202,7 @@ def write_markdown(report: UpgradeResult, out_dir: Path, date_prefix: str) -> Pa
     md: list[str] = []
     _md_header(md, report)
     _md_summary(md, report)
+    _md_files_changed(md, report)
     _md_steps(md, report)
     _md_vulnerability_tables(md, report)
     _md_upgraded_packages(md, report)
@@ -239,22 +245,52 @@ def _md_header(md: list[str], report: UpgradeResult) -> None:
 
 
 def _md_summary(md: list[str], report: UpgradeResult) -> None:
+    """Describe what actually changed, not what the settings allowed."""
     md.append("## Summary")
     md.append("")
-    if report.allow_major is None:
-        upgrade_desc = "**minor/patch** versions (no major version changes)"
-    elif len(report.allow_major) == 0:
-        upgrade_desc = "**available** versions (including major upgrades)"
-    else:
-        upgrade_desc = (
-            f"**available** versions (major upgrades for: "
-            f"{', '.join(report.allow_major)}; minor/patch for the rest)"
-        )
+    md.append(f"{_change_summary(report)} Dependency file: {_write_back_status(report)}.")
+    md.append("")
     md.append(
-        f"Upgraded Python dependencies to their latest {upgrade_desc}. "
         f"Detected **{len(report.pre_audit_vulns)}** known vulnerabilities before the upgrade "
         f"and **{len(report.post_audit_vulns)}** after the upgrade."
     )
+    md.append("")
+    md.append("---")
+    md.append("")
+
+
+def _change_summary(report: UpgradeResult) -> str:
+    """One sentence: how many packages moved, and which crossed a major or went down."""
+    if not report.upgraded and not report.new_deps:
+        return "No package versions changed."
+    kinds = {p.name: classify_bump(p.old_version, p.new_version) for p in report.upgraded}
+    majors = sorted(name for name, kind in kinds.items() if kind == "major")
+    downgrades = sorted(name for name, kind in kinds.items() if kind == "downgrade")
+    parts = [f"**{len(report.upgraded)}** package(s) changed version"]
+    if majors:
+        parts.append(f"**{len(majors)} across a major version** ({', '.join(majors)})")
+    elif report.upgraded:
+        parts.append("none across a major version")
+    if downgrades:
+        parts.append(f"**{len(downgrades)} downgraded** ({', '.join(downgrades)})")
+    if report.new_deps:
+        parts.append(f"{len(report.new_deps)} new transitive dependencies")
+    return "; ".join(parts) + "."
+
+
+def _md_files_changed(md: list[str], report: UpgradeResult) -> None:
+    """Show the dependency-file diff exactly as written (or as it would be written)."""
+    md.append("## Files Changed")
+    md.append("")
+    if not report.manifest_diff:
+        md.append(f"`{report.requirements_path}`: no changes.")
+    else:
+        if not report.dep_file_updated:
+            md.append(f"Not written ({_write_back_status(report)}); the change would be:")
+            md.append("")
+        md.append("```diff")
+        md.append(report.manifest_diff.rstrip("\n"))
+        md.append("```")
     md.append("")
     md.append("---")
     md.append("")

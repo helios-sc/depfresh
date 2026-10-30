@@ -216,7 +216,7 @@ def create_fake_venv(venv_root: Path, python_version: str) -> None:
 def main() -> int:
     args = sys.argv[1:]
     if args == ["--version"]:
-        print("uv 0.6.17")
+        print("uv 0.13.6 (fake)")
         return 0
 
     if args[:1] == ["venv"]:

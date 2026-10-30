@@ -11,7 +11,9 @@ Supports:
 from __future__ import annotations
 
 import logging
+import re
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 
 if sys.version_info >= (3, 11):
@@ -28,6 +30,7 @@ from depfresh.parsers._requirements import (
     RequirementsSimpleHandler,
     _merge_continuation_lines,
 )
+from depfresh.textio import UnreadableTextError, read_text
 
 log = logging.getLogger("depfresh")
 
@@ -49,7 +52,7 @@ def detect_format(path: Path) -> DependencyFormat:
         return DependencyFormat.REQUIREMENTS_IN
 
     if name == "pyproject.toml":
-        data = tomllib.loads(path.read_text())
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
         has_pep621 = bool(data.get("project", {}).get("dependencies"))
         has_poetry = bool(data.get("tool", {}).get("poetry", {}).get("dependencies"))
         if has_pep621:
@@ -61,43 +64,165 @@ def detect_format(path: Path) -> DependencyFormat:
             "nor [tool.poetry.dependencies]"
         )
 
-    # Default: requirements.txt (simple vs hashed)
-    try:
-        content = path.read_text(encoding="utf-8")
-    except UnicodeDecodeError:
-        raise ValueError(
-            f"{path}: file is not valid UTF-8. "
-            "Re-save it as UTF-8 or specify --dep-file / --format explicitly."
-        )
+    # Default: requirements.txt (simple vs hashed), UTF-8 or UTF-16
+    content = read_text(path)
     if "--hash=" in content:
         return DependencyFormat.REQUIREMENTS_HASHED
     return DependencyFormat.REQUIREMENTS_SIMPLE
 
 
-def detect_dep_file(target_dir: Path) -> Path:
-    """Scan *target_dir* for a known dependency file, in priority order.
+_CANDIDATES = ("requirements.txt", "requirements.in", "pyproject.toml", "Pipfile")
 
-    Returns the first match found.  Raises ``FileNotFoundError`` if none.
+
+@dataclass(frozen=True)
+class DepFileChoice:
+    """The dependency file auto-detection picked, and why.
+
+    Attributes:
+        path: The chosen file.
+        reason: Human-readable explanation, logged and shown in reports.
+        extras: Extras the project's Dockerfile installs (``pip install
+            -e ".[full,gcs]"``), when the choice came from a Dockerfile.
     """
-    candidates = [
-        "requirements.txt",
-        "requirements.in",
-        "pyproject.toml",
-        "Pipfile",
-    ]
-    for name in candidates:
+
+    path: Path
+    reason: str
+    extras: tuple[str, ...] = ()
+
+
+def detect_dep_file(target_dir: Path) -> Path:
+    """Return the dependency file to use for *target_dir* (see :func:`choose_dep_file`)."""
+    return choose_dep_file(target_dir).path
+
+
+def choose_dep_file(target_dir: Path) -> DepFileChoice:
+    """Pick the manifest that describes what *target_dir* ships.
+
+    In order:
+
+    1. ``pyproject.toml`` when a ``uv.lock`` sits next to it: the lock is
+       what ``uv sync --frozen`` installs.
+    2. What a ``Dockerfile`` in *target_dir* installs: the file passed to
+       ``pip install -r``, or ``pyproject.toml`` for ``pip install .``/``-e .``
+       and ``uv sync`` (with the extras named there).  A ``requirements.txt``
+       that nothing installs is not the shipped manifest.
+    3. The first of ``requirements.txt``, ``requirements.in``,
+       ``pyproject.toml``, ``Pipfile`` that exists and can be read.
+
+    Raises:
+        FileNotFoundError: If no dependency file exists.
+    """
+    pyproject = target_dir / "pyproject.toml"
+    has_pyproject = _declares_dependencies(pyproject)
+
+    if has_pyproject and (target_dir / "uv.lock").exists():
+        return DepFileChoice(pyproject, "pyproject.toml with uv.lock (the lock is what ships)")
+
+    hint = _dockerfile_hint(target_dir, has_pyproject)
+    if hint is not None:
+        return hint
+
+    readable = []
+    for name in _CANDIDATES:
         p = target_dir / name
-        if p.exists():
+        if not p.exists():
+            continue
+        if name == "pyproject.toml" and not has_pyproject:
+            continue
+        if name.startswith("requirements"):
             try:
-                p.read_text(encoding="utf-8")
-            except UnicodeDecodeError:
-                log.warning("Skipping %s (not valid UTF-8)", p)
+                read_text(p)
+            except UnreadableTextError:
+                log.warning("Skipping %s (not valid UTF-8 or UTF-16)", p)
                 continue
-            return p
-    raise FileNotFoundError(
-        f"No dependency file found in {target_dir}. "
-        f"Looked for: {', '.join(candidates)}"
+        readable.append(p)
+    if not readable:
+        raise FileNotFoundError(
+            f"No dependency file found in {target_dir}. "
+            f"Looked for: {', '.join(_CANDIDATES)}"
+        )
+    chosen = readable[0]
+    if len(readable) > 1:
+        log.warning(
+            "Several dependency files in %s (%s); using %s. Pass --dep-file to choose another.",
+            target_dir, ", ".join(p.name for p in readable), chosen.name,
+        )
+    return DepFileChoice(chosen, f"first of {', '.join(_CANDIDATES)} present")
+
+
+def _declares_dependencies(pyproject: Path) -> bool:
+    """True when *pyproject* exists and declares PEP 621 or Poetry dependencies."""
+    if not pyproject.is_file():
+        return False
+    try:
+        data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+    except (tomllib.TOMLDecodeError, UnicodeDecodeError):
+        return False
+    project = data.get("project", {})
+    return bool(
+        "dependencies" in project
+        or project.get("optional-dependencies")
+        or data.get("tool", {}).get("poetry", {}).get("dependencies")
     )
+
+
+_REQ_FLAG = re.compile(r"(?:^|\s)(?:-r|--requirement)(?:\s+|=)[\"']?([^\s\"';&|]+)")
+_PROJECT_INSTALL = re.compile(
+    r"(?:pip3?|uv\s+pip)\s+install\b[^;&|]*?(?:\s|^)(?:-e\s+|--editable\s+)?"
+    r"[\"']?\.(?:\[([^\]]*)\])?[\"']?(?=\s|$|[;&|])"
+)
+_UV_SYNC = re.compile(r"\buv\s+sync\b(?P<args>[^;&|]*)")
+
+
+def _dockerfile_hint(target_dir: Path, has_pyproject: bool) -> DepFileChoice | None:
+    """Infer the shipped manifest from the RUN instructions of local Dockerfiles."""
+    dockerfiles = sorted(
+        p for p in target_dir.iterdir()
+        if p.is_file() and (p.name == "Dockerfile" or p.name.startswith("Dockerfile.")
+                            or p.name.endswith(".Dockerfile"))
+    )
+    for dockerfile in dockerfiles:
+        try:
+            text = dockerfile.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for command in _run_commands(text):
+            for match in _REQ_FLAG.finditer(command):
+                candidate = target_dir / Path(match.group(1)).name
+                if candidate.is_file():
+                    return DepFileChoice(
+                        candidate, f"{dockerfile.name} installs it (pip install -r)",
+                    )
+            if not has_pyproject:
+                continue
+            project = _PROJECT_INSTALL.search(command)
+            if project:
+                extras = tuple(
+                    e.strip() for e in (project.group(1) or "").split(",") if e.strip()
+                )
+                return DepFileChoice(
+                    target_dir / "pyproject.toml",
+                    f"{dockerfile.name} installs the project (pip install .)",
+                    extras,
+                )
+            sync = _UV_SYNC.search(command)
+            if sync:
+                extras = tuple(re.findall(r"--extra[\s=]+([A-Za-z0-9_.-]+)", sync.group("args")))
+                return DepFileChoice(
+                    target_dir / "pyproject.toml", f"{dockerfile.name} runs uv sync", extras,
+                )
+    return None
+
+
+def _run_commands(dockerfile_text: str) -> list[str]:
+    """Return the shell commands of the RUN instructions, continuation lines joined."""
+    joined = re.sub(r"\\\r?\n", " ", dockerfile_text)
+    commands = []
+    for line in joined.splitlines():
+        stripped = line.strip()
+        if stripped.upper().startswith("RUN "):
+            commands.append(stripped[4:].strip())
+    return commands
 
 
 def get_handler(fmt: DependencyFormat) -> FormatHandler:
@@ -124,6 +249,8 @@ __all__ = [
     "PipfileHandler",
     "detect_format",
     "detect_dep_file",
+    "choose_dep_file",
+    "DepFileChoice",
     "get_handler",
     "_FORMAT_CHOICES",
     "_merge_continuation_lines",

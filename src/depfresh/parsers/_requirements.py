@@ -17,6 +17,7 @@ from depfresh.parsers._helpers import (
     _format_requirement,
     _update_specifier_string,
 )
+from depfresh.textio import TextFile, read_text, read_text_file, write_text_like
 
 log = logging.getLogger("depfresh")
 
@@ -41,7 +42,8 @@ class RequirementsSimpleHandler:
 
     def write(self, pkgs: dict[str, str], path: Path, **kwargs: Any) -> None:
         lines = [name if ver == "*" else f"{name}=={ver}" for name, ver in sorted(pkgs.items())]
-        path.write_text("\n".join(lines) + "\n")
+        original = read_text_file(path) if path.exists() else TextFile("")
+        write_text_like(path, "\n".join(lines) + "\n", original)
         log.debug("Wrote requirements: %s (%d packages)", path, len(lines))
 
 
@@ -98,7 +100,8 @@ class RequirementsInHandler:
         Preserves comments and non-requirement lines.  For requirement
         lines, updates the version specifier with ``>=new_version``.
         """
-        original_lines = path.read_text().splitlines()
+        original = read_text_file(path)
+        original_lines = original.text.splitlines()
         new_lines: list[str] = []
 
         for line in original_lines:
@@ -131,7 +134,7 @@ class RequirementsInHandler:
             else:
                 new_lines.append(line)
 
-        path.write_text("\n".join(new_lines) + "\n")
+        write_text_like(path, "\n".join(new_lines) + "\n", original)
         log.debug("Wrote requirements.in: %s (%d packages)", path, len(pkgs))
 
 
@@ -162,7 +165,7 @@ _PIP_DIRECTIVE_PATTERNS: dict[str, str] = {
 def _inspect_requirements_file(path: Path) -> DependencyInspection:
     """Inspect a requirements-style file line-by-line."""
     inspection = DependencyInspection()
-    lines = _merge_continuation_lines(path.read_text().splitlines())
+    lines = _merge_continuation_lines(read_text(path).splitlines())
 
     for stripped in lines:
         if not stripped or stripped.startswith("#"):

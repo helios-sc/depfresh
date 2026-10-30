@@ -49,13 +49,30 @@ class DependencyInspection:
 
 @dataclass
 class Vulnerability:
-    """A single known vulnerability found by pip-audit."""
+    """One advisory affecting one installed package, as found by pip-audit.
+
+    OSV often returns the same advisory more than once (a GHSA record and a
+    PYSEC record that alias each other); depfresh merges those into a single
+    :class:`Vulnerability`.  ``cve`` is the display id (the CVE alias when
+    there is one) and ``aliases`` holds every other id of the advisory.
+    """
 
     package: str
     version: str
     cve: str
     fix_versions: str
     description: str
+    aliases: tuple[str, ...] = ()
+
+    @property
+    def ids(self) -> tuple[str, ...]:
+        """All ids of this advisory: the display id first, then the aliases."""
+        return (self.cve, *(a for a in self.aliases if a != self.cve))
+
+    @property
+    def ghsa(self) -> str:
+        """The GitHub Advisory Database id, or ``""`` when the advisory has none."""
+        return next((i for i in self.ids if i.startswith("GHSA-")), "")
 
 
 @dataclass
@@ -104,6 +121,9 @@ class UpgradeResult:
     import_regressions: dict[str, str] = field(default_factory=dict)
     #: Why the write-back was withheld (empty when it ran or on a dry run).
     write_back_skipped: str = ""
+    #: Unified diff of the dependency file: what was written, or on a dry run
+    #: (or a withheld write-back) what would have been written.
+    manifest_diff: str = ""
 
     pre_audit_vulns: list[Vulnerability] = field(default_factory=list)
     post_audit_vulns: list[Vulnerability] = field(default_factory=list)

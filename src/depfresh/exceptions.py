@@ -8,11 +8,25 @@ class DepfreshError(Exception):
 
 
 class UvNotFoundError(DepfreshError):
-    """Raised when the ``uv`` binary cannot be found on PATH."""
+    """Raised when the ``uv`` binary cannot be found."""
 
-    def __init__(self) -> None:
+    def __init__(self, message: str | None = None) -> None:
         super().__init__(
-            "'uv' is not installed. Install it from https://docs.astral.sh/uv/"
+            message or "'uv' is not installed. Install it from https://docs.astral.sh/uv/"
+        )
+
+
+class UvVersionError(DepfreshError):
+    """Raised when every ``uv`` binary found is older than depfresh's minimum."""
+
+    def __init__(self, found: list[tuple[str, str]], minimum: str) -> None:
+        self.found = found
+        self.minimum = minimum
+        listing = ", ".join(f"uv {version} at {path}" for path, version in found)
+        super().__init__(
+            f"depfresh needs uv >= {minimum}, found {listing}. Upgrade uv "
+            "(https://docs.astral.sh/uv/) or point depfresh at a newer binary "
+            "with --uv or DEPFRESH_UV."
         )
 
 

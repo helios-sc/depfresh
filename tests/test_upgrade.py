@@ -255,6 +255,34 @@ class TestUpgradeHappyPath:
             upgrade(tmp_path, dry_run=True, label="test", reports_dir=tmp_path)
         assert req_file.read_text() == original_content
 
+    def test_dry_run_reports_the_diff_it_would_write(
+        self, tmp_path: Path, req_file: Path,
+    ) -> None:
+        original_content = req_file.read_text()
+        setup_mock = _make_setup_venv_mock(
+            tmp_path, old_pkgs={"flask": "2.3.0", "requests": "2.28.0"},
+        )
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.9.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(
+                _upgrade_mod, "freeze", return_value={"flask": "2.3.3", "requests": "2.28.0"},
+            ),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+        ):
+            result = upgrade(tmp_path, dry_run=True, label="test", reports_dir=tmp_path)
+        assert req_file.read_text() == original_content
+        assert "-flask==2.3.0" in result.manifest_diff
+        assert "+flask==2.3.3" in result.manifest_diff
+        assert result.dep_file_updated is False
+
     def test_pre_vulns_appear_in_result(self, tmp_path: Path, req_file: Path) -> None:
         vuln = Vulnerability("urllib3", "2.0.0", "CVE-2023-001", "2.0.6", "desc")
         setup_mock = _make_setup_venv_mock(tmp_path, old_pkgs={"urllib3": "2.0.0"})

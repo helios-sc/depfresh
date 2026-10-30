@@ -180,6 +180,68 @@ class TestParsePipAuditJson:
         assert _parse_pip_audit_json(json.dumps(data)) == []
 
 
+class TestAliasDeduplication:
+    """OSV returns one advisory as several records; each advisory counts once."""
+
+    @staticmethod
+    def _payload(vulns: list[dict[str, object]]) -> str:
+        return json.dumps({
+            "dependencies": [{"name": "urllib3", "version": "2.6.3", "vulns": vulns}],
+            "fixes": [],
+        })
+
+    def test_pysec_and_ghsa_records_of_one_advisory_merge(self) -> None:
+        vulns = _parse_pip_audit_json(self._payload([
+            {"id": "PYSEC-2026-141", "aliases": ["CVE-2026-44431", "GHSA-qccp-gfcp-xxvc"],
+             "fix_versions": ["2.7.0"], "description": "a"},
+            {"id": "GHSA-qccp-gfcp-xxvc", "aliases": ["CVE-2026-44431"],
+             "fix_versions": ["2.7.0"], "description": "a"},
+        ]))
+        assert len(vulns) == 1
+        assert vulns[0].cve == "CVE-2026-44431"
+        assert vulns[0].ghsa == "GHSA-qccp-gfcp-xxvc"
+        assert set(vulns[0].aliases) == {"PYSEC-2026-141", "GHSA-qccp-gfcp-xxvc"}
+
+    def test_repeated_identical_records_merge(self) -> None:
+        record = {"id": "PYSEC-2026-4175", "aliases": ["GHSA-8988-9cw3-xx77", "CVE-2026-97687"],
+                  "fix_versions": ["2.8.0"], "description": "b"}
+        vulns = _parse_pip_audit_json(self._payload([record, dict(record)]))
+        assert len(vulns) == 1
+
+    def test_distinct_advisories_stay_separate(self) -> None:
+        vulns = _parse_pip_audit_json(self._payload([
+            {"id": "PYSEC-1", "aliases": ["CVE-1"], "fix_versions": ["2.7.0"]},
+            {"id": "PYSEC-2", "aliases": ["CVE-2"], "fix_versions": ["2.8.0"]},
+        ]))
+        assert sorted(v.cve for v in vulns) == ["CVE-1", "CVE-2"]
+
+    def test_merged_fix_versions_are_the_union(self) -> None:
+        vulns = _parse_pip_audit_json(self._payload([
+            {"id": "GHSA-a", "aliases": ["CVE-9"], "fix_versions": ["2.10.0"]},
+            {"id": "PYSEC-9", "aliases": ["CVE-9"], "fix_versions": ["2.9.0", "2.10.0"]},
+        ]))
+        assert len(vulns) == 1
+        assert vulns[0].fix_versions == "2.9.0, 2.10.0"
+
+    def test_record_linking_two_groups_merges_them(self) -> None:
+        vulns = _parse_pip_audit_json(self._payload([
+            {"id": "GHSA-x", "aliases": []},
+            {"id": "PYSEC-y", "aliases": []},
+            {"id": "OSV-z", "aliases": ["GHSA-x", "PYSEC-y"]},
+        ]))
+        assert len(vulns) == 1
+
+    def test_same_advisory_in_two_packages_counts_per_package(self) -> None:
+        data = {"dependencies": [
+            {"name": "fastmcp", "version": "3.4.2",
+             "vulns": [{"id": "GHSA-7xgj-8392-5q4r", "aliases": [], "fix_versions": ["4.1.2"]}]},
+            {"name": "fastmcp-slim", "version": "3.4.2",
+             "vulns": [{"id": "GHSA-7xgj-8392-5q4r", "aliases": [], "fix_versions": ["4.1.2"]}]},
+        ]}
+        vulns = _parse_pip_audit_json(json.dumps(data))
+        assert [v.package for v in vulns] == ["fastmcp", "fastmcp-slim"]
+
+
 class TestAuditCommand:
     def test_audits_exact_pins_without_resolving(self, tmp_path: Path) -> None:
         """--no-deps --disable-pip: pip-audit must not build its own resolver venv."""

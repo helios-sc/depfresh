@@ -19,6 +19,7 @@ from depfresh.parsers import (
     RequirementsInHandler,
     RequirementsSimpleHandler,
     _merge_continuation_lines,
+    choose_dep_file,
     detect_dep_file,
     detect_format,
     get_handler,
@@ -116,6 +117,79 @@ class TestDetectDepFile:
     def test_no_file_raises(self, tmp_path: Path) -> None:
         with pytest.raises(FileNotFoundError, match="No dependency file"):
             detect_dep_file(tmp_path)
+
+
+class TestChooseDepFile:
+    """What ships wins over the historical requirements.txt-first order."""
+
+    @staticmethod
+    def _project(tmp_path: Path, dockerfile: str | None = None, lock: bool = False) -> None:
+        (tmp_path / "requirements.txt").write_text("pandas>=2.0.0\n")
+        (tmp_path / "pyproject.toml").write_text(dedent("""\
+            [project]
+            name = "demo"
+            dependencies = ["pandas"]
+
+            [project.optional-dependencies]
+            full = ["xgboost"]
+            gcs = ["google-cloud-storage>=2.0"]
+        """))
+        if lock:
+            (tmp_path / "uv.lock").write_text("version = 1\n")
+        if dockerfile is not None:
+            (tmp_path / "Dockerfile").write_text(dockerfile)
+
+    def test_prefers_pyproject_when_a_uv_lock_exists(self, tmp_path: Path) -> None:
+        self._project(tmp_path, lock=True)
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert "uv.lock" in choice.reason
+
+    def test_dead_requirements_txt_loses_to_the_installed_project(self, tmp_path: Path) -> None:
+        """The Dockerfile installs .[full,gcs]; requirements.txt is unused."""
+        self._project(
+            tmp_path,
+            'FROM python:3.11-bookworm\nCOPY . .\n'
+            'RUN pip install --no-cache-dir -e ".[full,gcs]"\n',
+        )
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert choice.extras == ("full", "gcs")
+
+    def test_plain_project_install(self, tmp_path: Path) -> None:
+        self._project(tmp_path, "FROM python:3.11\nRUN pip install --no-cache-dir -e .\n")
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert choice.extras == ()
+
+    def test_requirements_file_named_by_the_dockerfile(self, tmp_path: Path) -> None:
+        self._project(
+            tmp_path,
+            "FROM python:3.11\nCOPY ./requirements.txt /code/requirements.txt\n"
+            "RUN pip install --no-cache-dir --upgrade \\\n    -r /code/requirements.txt\n",
+        )
+        assert choose_dep_file(tmp_path).path.name == "requirements.txt"
+
+    def test_uv_sync_with_extras(self, tmp_path: Path) -> None:
+        self._project(tmp_path, "FROM python:3.12\nRUN uv sync --no-dev --extra gcs\n")
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert choice.extras == ("gcs",)
+
+    def test_without_hints_keeps_requirements_first(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        self._project(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="depfresh"):
+            choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "requirements.txt"
+        assert "--dep-file" in caplog.text
+
+    def test_tool_only_pyproject_is_not_a_manifest(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text("[tool.ruff]\nline-length = 100\n")
+        (tmp_path / "uv.lock").write_text("version = 1\n")
+        (tmp_path / "requirements.txt").write_text("flask==2.3.0\n")
+        assert choose_dep_file(tmp_path).path.name == "requirements.txt"
 
 
 class TestGetHandler:

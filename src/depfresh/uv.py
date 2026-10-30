@@ -8,10 +8,13 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
+from packaging.version import InvalidVersion, Version
+
 from depfresh.constraints import normalise
-from depfresh.exceptions import CommandError, UvNotFoundError
+from depfresh.exceptions import CommandError, UvNotFoundError, UvVersionError
 
 log = logging.getLogger("depfresh")
 
@@ -46,22 +49,96 @@ def run(
 # uv discovery
 # ---------------------------------------------------------------------------
 
-def find_uv() -> str:
-    """Locate the ``uv`` binary on PATH.
+#: Oldest uv depfresh supports.  Older releases cannot read the lockfile
+#: revisions current uv writes (uv 0.6.17 fails on ``revision = 3``) and lack
+#: options depfresh relies on (``uv export --no-emit-project``, ``uv lock
+#: --check``, ``--no-default-groups``, named ``[[tool.uv.index]]`` entries).
+MIN_UV_VERSION = "0.9.0"
 
-    Raises :class:`UvNotFoundError` if not found.
+#: Environment variable naming the uv binary to use.
+UV_ENV_VAR = "DEPFRESH_UV"
+
+
+def find_uv(explicit: str | None = None) -> str:
+    """Locate a ``uv`` binary that is at least :data:`MIN_UV_VERSION`.
+
+    Candidates, in order: *explicit* (``--uv``), the ``DEPFRESH_UV``
+    environment variable, a ``uv`` installed in the same environment as
+    depfresh, then every ``uv`` on ``PATH``.  An explicit choice is never
+    replaced by another binary: if it is missing or too old, that is an
+    error.  Otherwise the first candidate that is new enough wins, so an
+    old ``uv`` early on ``PATH`` is skipped (and logged), never used silently.
+
+    Raises:
+        UvNotFoundError: If no ``uv`` binary exists.
+        UvVersionError: If every ``uv`` found is older than the minimum.
     """
-    uv = shutil.which("uv")
-    if not uv:
-        raise UvNotFoundError()
-    return uv
+    chosen = explicit or os.environ.get(UV_ENV_VAR)
+    if chosen:
+        resolved = shutil.which(chosen) or (chosen if Path(chosen).is_file() else None)
+        if not resolved:
+            raise UvNotFoundError(f"uv binary {chosen!r} not found")
+        version = get_uv_version(resolved)
+        if not uv_version_ok(version):
+            raise UvVersionError([(resolved, version)], MIN_UV_VERSION)
+        return resolved
+
+    too_old: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for candidate in _uv_candidates():
+        real = os.path.realpath(candidate)
+        if real in seen:
+            continue
+        seen.add(real)
+        version = get_uv_version(candidate)
+        if uv_version_ok(version):
+            if too_old:
+                log.info(
+                    "Skipping uv %s (older than %s); using uv %s at %s",
+                    ", ".join(f"{v} at {p}" for p, v in too_old), MIN_UV_VERSION,
+                    version, candidate,
+                )
+            return candidate
+        too_old.append((candidate, version))
+    if too_old:
+        raise UvVersionError(too_old, MIN_UV_VERSION)
+    raise UvNotFoundError()
+
+
+def _uv_candidates() -> list[str]:
+    """uv binaries next to the running interpreter, then every uv on PATH."""
+    candidates: list[str] = []
+    exe = "uv.exe" if sys.platform == "win32" else "uv"
+    for directory in (sysconfig.get_path("scripts"), str(Path(sys.executable).parent)):
+        path = Path(directory) / exe
+        if path.is_file() and os.access(path, os.X_OK):
+            candidates.append(str(path))
+    for directory in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        if not directory:
+            continue
+        path = Path(directory) / exe
+        if path.is_file() and os.access(path, os.X_OK):
+            candidates.append(str(path))
+    return candidates
+
+
+def uv_version_ok(version: str) -> bool:
+    """True when *version* parses and is at least :data:`MIN_UV_VERSION`."""
+    try:
+        return Version(version) >= Version(MIN_UV_VERSION)
+    except InvalidVersion:
+        return False
 
 
 def get_uv_version(uv: str) -> str:
-    """Return the version string for the given *uv* binary."""
-    result = run([uv, "--version"], check=False)
-    if result.returncode == 0:
-        return result.stdout.strip().split()[1]
+    """Return the version string for the given *uv* binary (``"unknown"`` on failure)."""
+    try:
+        result = run([uv, "--version"], check=False)
+    except OSError:
+        return "unknown"
+    parts = result.stdout.strip().split()
+    if result.returncode == 0 and len(parts) >= 2:
+        return parts[1]
     return "unknown"
 
 

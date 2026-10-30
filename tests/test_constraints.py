@@ -8,10 +8,12 @@ import pytest
 
 from depfresh.constraints import (
     build_constraints,
+    classify_bump,
     compute_changes,
     diagnose_remaining,
     format_allow_major,
     format_keep_version,
+    is_calver,
     normalise,
 )
 from depfresh.models import Vulnerability
@@ -250,3 +252,29 @@ class TestUnknownPackageWarnings:
             build_constraints({"flask": "2.0"}, allow_major=[])
         warning_messages = [rec.message for rec in caplog.records if rec.levelno >= logging.WARNING]
         assert not warning_messages
+
+
+class TestClassifyBump:
+    @pytest.mark.parametrize(
+        ("old", "new", "kind"),
+        [
+            ("2.0.4", "2.0.6", "patch"),
+            ("4.13.0", "4.14.2", "minor"),
+            ("0.86.0", "0.87.0", "0.x-minor"),
+            ("0.6.3", "0.6.5", "patch"),
+            ("46.0.6", "50.0.2", "major"),
+            ("2026.2.25", "2026.10.23", "calver"),
+            ("2024.12.14", "2026.10.19", "calver"),
+            ("3.17.1", "2.19.0", "downgrade"),
+            ("1.0", "1.0.0", "same"),
+            ("(new)", "1.0", "new"),
+            ("1.0", "", "removed"),
+            ("1.0", "not-a-version", "unknown"),
+        ],
+    )
+    def test_kinds(self, old: str, new: str, kind: str) -> None:
+        assert classify_bump(old, new) == kind
+
+    def test_calendar_versions(self) -> None:
+        assert is_calver("2026.10.19")
+        assert not is_calver("23.12.1")  # black's YY.M scheme still counts as a major

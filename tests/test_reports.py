@@ -140,3 +140,44 @@ class TestImportRegressionReporting:
         content = write_log(report, tmp_path, "2026-01-15").read_text()
         assert "REGRESSIONS (1)" in content
         assert "Import regressions: 1" in content
+
+
+
+class TestAccurateSummary:
+    """The PR text said "no major version changes" while the manifest changed."""
+
+    def test_reports_majors_that_actually_happened(self, tmp_path: Path) -> None:
+        report = _make_report(
+            upgraded=[
+                PackageChange("cryptography", "46.0.6", "50.0.2", is_security_fix=True),
+                PackageChange("idna", "3.11", "3.15"),
+            ],
+        )
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "1 across a major version** (cryptography)" in content
+        assert "no major version changes" not in content
+
+    def test_reports_downgrades(self, tmp_path: Path) -> None:
+        report = _make_report(
+            upgraded=[PackageChange("google-cloud-storage", "3.17.1", "2.19.0")],
+        )
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "1 downgraded** (google-cloud-storage)" in content
+
+    def test_manifest_diff_is_shown_even_without_version_changes(self, tmp_path: Path) -> None:
+        diff = (
+            "--- a/pyproject.toml\n+++ b/pyproject.toml\n@@ -1 +1 @@\n"
+            '-    "fastapi>=0.115",\n+    "fastapi>=0.162.0",\n'
+        )
+        report = _make_report(
+            requirements_path="pyproject.toml", manifest_diff=diff, dep_file_updated=True,
+        )
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "No package versions changed." in content
+        assert "## Files Changed" in content
+        assert '+    "fastapi>=0.162.0",' in content
+
+    def test_unwritten_diff_is_labelled(self, tmp_path: Path) -> None:
+        report = _make_report(manifest_diff="-a\n+b\n", dry_run=True)
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "Not written (no (dry-run)); the change would be:" in content

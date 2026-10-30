@@ -47,7 +47,7 @@ class PyprojectPEP621Handler:
         }
 
     def inspect(self, path: Path) -> DependencyInspection:
-        data = tomllib.loads(path.read_text())
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
         inspection = DependencyInspection()
 
         for dep_str in data.get("project", {}).get("dependencies", []):
@@ -71,7 +71,7 @@ class PyprojectPEP621Handler:
         return inspection
 
     def write(self, pkgs: dict[str, str], path: Path, **kwargs: Any) -> None:
-        doc = tomlkit.parse(path.read_text())
+        doc = tomlkit.parse(path.read_text(encoding="utf-8"))
         dependency_scope: DependencyScope = kwargs.get("dependency_scope", "all")
 
         if "project" in doc:
@@ -104,7 +104,7 @@ class PyprojectPoetryHandler:
         }
 
     def inspect(self, path: Path) -> DependencyInspection:
-        data = tomllib.loads(path.read_text())
+        data = tomllib.loads(path.read_text(encoding="utf-8"))
         inspection = DependencyInspection()
 
         poetry = data.get("tool", {}).get("poetry", {})
@@ -135,7 +135,7 @@ class PyprojectPoetryHandler:
         return inspection
 
     def write(self, pkgs: dict[str, str], path: Path, **kwargs: Any) -> None:
-        doc = tomlkit.parse(path.read_text())
+        doc = tomlkit.parse(path.read_text(encoding="utf-8"))
         dependency_scope: DependencyScope = kwargs.get("dependency_scope", "all")
 
         tool = cast(Any, doc.get("tool", {}))

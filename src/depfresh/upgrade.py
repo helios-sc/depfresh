@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import difflib
 import logging
 import os
 import shutil
@@ -22,11 +23,12 @@ from depfresh.models import DependencyScope, DependencySpec, UpgradeResult, Vuln
 from depfresh.parsers import (
     DependencyFormat,
     FormatHandler,
-    detect_dep_file,
+    choose_dep_file,
     detect_format,
     get_handler,
 )
 from depfresh.reports import write_log, write_markdown
+from depfresh.textio import decode_bytes, read_text_file
 from depfresh.uv import (
     cleanup_venv,
     create_venv,
@@ -95,9 +97,11 @@ def _resolve_dep_file(
         req_path = target_dir / dep_file
     else:
         try:
-            req_path = detect_dep_file(target_dir)
+            choice = choose_dep_file(target_dir)
         except FileNotFoundError as exc:
             raise RequirementsNotFoundError(str(target_dir)) from exc
+        req_path = choice.path
+        log.info("Auto-detected %s: %s", req_path.name, choice.reason)
 
     if not req_path.exists():
         raise RequirementsNotFoundError(str(req_path))
@@ -210,6 +214,7 @@ def _prepare_run(
     dependency_scope: DependencyScope,
     ignore_direct_references: bool,
     log_header: str,
+    uv_binary: str | None = None,
 ) -> _CommonSetup:
     """Validate inputs, resolve the dep file, create venvs, and install deps.
 
@@ -222,8 +227,6 @@ def _prepare_run(
         raise TargetNotFoundError(str(target_dir))
 
     req_path, dep_format, handler = _resolve_dep_file(target_dir, dep_file, fmt)
-    uv = find_uv()
-    uv_version = get_uv_version(uv)
 
     log.info("%s — %s (format: %s)", log_header, req_path, dep_format.value)
     log.info("  dependency scope: %s", dependency_scope)
@@ -242,6 +245,10 @@ def _prepare_run(
         for dep in ignored_direct_refs:
             log.warning("Ignoring direct reference due to --ignore-direct-references: %s", dep)
 
+    uv = find_uv(uv_binary)
+    uv_version = get_uv_version(uv)
+    log.info("Using uv %s at %s", uv_version, uv)
+
     use_original_requirements = (
         dep_format in (
             DependencyFormat.REQUIREMENTS_SIMPLE,
@@ -249,6 +256,9 @@ def _prepare_run(
             DependencyFormat.REQUIREMENTS_IN,
         )
         and not ignored_direct_refs
+        # uv reads requirements files as UTF-8; a UTF-16 file goes through
+        # the synthesized install file instead.
+        and read_text_file(req_path).is_utf8
     )
 
     work_dir = Path(tempfile.mkdtemp(prefix=f"depfresh-{_RUN_ID}-"))
@@ -288,6 +298,31 @@ def _prepare_run(
         old_pkgs=old_pkgs,
         ignored_direct_refs=ignored_direct_refs,
     )
+
+
+def _render_write(
+    handler: FormatHandler, pkgs: dict[str, str], req_path: Path, **kwargs: object,
+) -> bytes:
+    """Return the bytes *handler* would write to *req_path*, without touching it."""
+    with tempfile.TemporaryDirectory(prefix="depfresh-render-") as tmp:
+        copy = Path(tmp) / req_path.name
+        shutil.copy2(req_path, copy)
+        handler.write(pkgs, copy, **kwargs)
+        return copy.read_bytes()
+
+
+def manifest_diff(path: Path, new_content: bytes) -> str:
+    """Unified diff between *path* on disk and *new_content* (``""`` if equal)."""
+    before = read_text_file(path).text
+    after = decode_bytes(new_content, source=str(path)).text
+    if before == after:
+        return ""
+    return "".join(difflib.unified_diff(
+        before.splitlines(keepends=True),
+        after.splitlines(keepends=True),
+        fromfile=f"a/{path.name}",
+        tofile=f"b/{path.name}",
+    ))
 
 
 # ---------------------------------------------------------------------------
@@ -345,6 +380,7 @@ def upgrade(
     allow_major: list[str] | None = None,
     keep_version: list[str] | None = None,
     reports_dir: str | Path | None = None,
+    uv_binary: str | None = None,
 ) -> UpgradeResult:
     """Upgrade Python dependencies and audit for vulnerabilities.
 
@@ -396,6 +432,10 @@ def upgrade(
     reports_dir:
         Directory for report output.  Defaults to ``./reports/`` relative
         to the current working directory.
+    uv_binary:
+        Path to the ``uv`` binary.  By default depfresh searches
+        ``DEPFRESH_UV``, its own environment and ``PATH`` for a uv of at least
+        :data:`depfresh.uv.MIN_UV_VERSION`.
 
     Returns
     -------
@@ -410,6 +450,8 @@ def upgrade(
         If no dependency file can be found.
     UvNotFoundError
         If ``uv`` is not installed.
+    UvVersionError
+        If every ``uv`` found is older than the supported minimum.
     """
     ctx = _prepare_run(
         target,
@@ -420,6 +462,7 @@ def upgrade(
         dependency_scope=dependency_scope,
         ignore_direct_references=ignore_direct_references,
         log_header="depfresh — upgrading",
+        uv_binary=uv_binary,
     )
 
     service_label = label or derive_label(ctx.target_dir)
@@ -494,6 +537,18 @@ def upgrade(
         final_count=len(new_pkgs),
     )
 
+    # Render the write-back on a copy first: the report shows exactly what
+    # changes (or would change) in the dependency file, dry run or not.
+    new_content = _render_write(
+        ctx.handler,
+        new_pkgs,
+        ctx.req_path,
+        uv=ctx.uv,
+        python_version=python,
+        dependency_scope=dependency_scope,
+    )
+    result.manifest_diff = manifest_diff(ctx.req_path, new_content)
+
     if result.import_regressions:
         result.write_back_skipped = (
             f"{len(result.import_regressions)} import(s) resolved before the upgrade "
@@ -505,15 +560,12 @@ def upgrade(
             ", ".join(result.import_regressions),
         )
     elif not dry_run:
-        ctx.handler.write(
-            new_pkgs,
-            ctx.req_path,
-            uv=ctx.uv,
-            python_version=python,
-            dependency_scope=dependency_scope,
-        )
-        result.dep_file_updated = True
-        log.info("%s UPDATED", ctx.req_path)
+        if result.manifest_diff:
+            ctx.req_path.write_bytes(new_content)
+            result.dep_file_updated = True
+            log.info("%s UPDATED", ctx.req_path)
+        else:
+            log.info("%s already up to date", ctx.req_path.name)
     else:
         log.info("DRY RUN — %s NOT modified", ctx.req_path.name)
         log.info("Would upgrade %d packages, add %d new deps", len(upgraded), len(new_deps))
@@ -536,6 +588,7 @@ def audit_only(
     venv_name: str = ".venv-audit",
     dependency_scope: DependencyScope = "runtime",
     ignore_direct_references: bool = False,
+    uv_binary: str | None = None,
 ) -> UpgradeResult:
     """Run a vulnerability audit without upgrading anything.
 
@@ -551,6 +604,7 @@ def audit_only(
         dependency_scope=dependency_scope,
         ignore_direct_references=ignore_direct_references,
         log_header="depfresh audit-only",
+        uv_binary=uv_binary,
     )
 
     try:

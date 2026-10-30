@@ -17,6 +17,49 @@ def normalise(name: str) -> str:
     return re.sub(r"[-_.]+", "-", name).lower()
 
 
+#: First release component at or above which a version is treated as a
+#: calendar version (certifi 2026.10.19, pytz 2026.1, tzdata 2025.3).  Moving
+#: between years is a data refresh, not an API break.
+CALVER_MIN_MAJOR = 1900
+
+
+def is_calver(version: str) -> bool:
+    """True for calendar versions such as ``2026.10.19`` (major >= 1900)."""
+    m = re.match(r"^(\d+)", version)
+    return m is not None and int(m.group(1)) >= CALVER_MIN_MAJOR
+
+
+def classify_bump(old: str, new: str) -> str:
+    """Classify a version change for reports and the major-upgrade policy.
+
+    Returns one of ``"same"``, ``"patch"``, ``"minor"``, ``"0.x-minor"`` (a
+    minor bump of a 0.x release, which may break), ``"major"``, ``"calver"``
+    (between calendar versions), ``"downgrade"``, ``"new"``/``"removed"``
+    (when one side is missing) or ``"unknown"`` when a version does not parse.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    if not old or old == "(new)":
+        return "new"
+    if not new or new == "(removed)":
+        return "removed"
+    try:
+        a, b = Version(old), Version(new)
+    except InvalidVersion:
+        return "unknown"
+    if a == b:
+        return "same"
+    if b < a:
+        return "downgrade"
+    if is_calver(old) and is_calver(new):
+        return "calver"
+    if b.major > a.major:
+        return "major"
+    if b.minor > a.minor:
+        return "0.x-minor" if a.major == 0 else "minor"
+    return "patch"
+
+
 def build_constraints(
     pkgs: dict[str, str],
     *,
