@@ -40,6 +40,9 @@ def probe_venv(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path]:
     (pkg / "tools" / "__init__.py").write_text("")
     (pkg / "tools" / "tool.py").write_text("raise RuntimeError('must not run')\n")
     (site / "flatmod.py").write_text("")
+    # google.cloud-style nested namespace packages (no __init__.py anywhere)
+    (site / "nsroot" / "inner").mkdir(parents=True)
+    (site / "nsroot" / "inner" / "leaf.py").write_text("")
     return str(python), marker
 
 
@@ -198,6 +201,17 @@ class TestBatchImportCheck:
         assert "not a package" in str(results["flatmod.sub"])
         assert warns == {}
         assert not marker.exists(), "the check imported sidefx/__init__.py"
+
+    def test_nested_namespace_packages(self, probe_venv: tuple[str, Path]) -> None:
+        """google.cloud.*: PathFinder needs the parent in sys.modules; the check must not."""
+        python, _ = probe_venv
+        results, _ = _batch_import_check(
+            python, {"nsroot", "nsroot.inner", "nsroot.inner.leaf", "nsroot.inner.gone"},
+        )
+        assert results["nsroot"] is None
+        assert results["nsroot.inner"] is None
+        assert results["nsroot.inner.leaf"] is None
+        assert "nsroot.inner.gone" in str(results["nsroot.inner.gone"])
 
 
 class TestImportRegressions:

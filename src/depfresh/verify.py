@@ -2,8 +2,8 @@
 
 Imports are read from the project's ``.py`` files with :mod:`ast` (no project
 code runs) and then *located* — not imported — in the target venv: the
-top-level name with :func:`importlib.util.find_spec`, each submodule with
-:class:`importlib.machinery.PathFinder` inside its parent's search path.  No
+top-level name with :func:`importlib.util.find_spec`, each submodule with a
+:class:`importlib.machinery.FileFinder` inside its parent's search path.  No
 third-party module code runs either, and one missing module cannot abort the
 check for the others.
 
@@ -206,11 +206,12 @@ def _batch_import_check(
 
     Each module is resolved on its own, inside its own ``try``: the top-level
     name with :func:`importlib.util.find_spec`, which searches ``sys.path``
-    without importing anything, then each dotted part with
-    :class:`importlib.machinery.PathFinder` in the parent's
-    ``submodule_search_locations``.  Unlike ``find_spec("pkg.sub")``, that never
-    imports ``pkg`` (no module code runs) and a missing ``pkg`` fails only
-    ``pkg.sub`` instead of the whole batch.
+    without importing anything, then each dotted part with a
+    :class:`importlib.machinery.FileFinder` over the parent's
+    ``submodule_search_locations`` (namespace packages such as ``google.cloud``
+    included).  Unlike ``find_spec("pkg.sub")``, that never imports ``pkg`` (no
+    module code runs) and a missing ``pkg`` fails only ``pkg.sub`` instead of
+    the whole batch.
 
     Returns ``(results, warnings)`` where:
       - results: ``{module: error_string_or_None}``
@@ -221,25 +222,50 @@ def _batch_import_check(
         return {}, {}
 
     check_script = textwrap.dedent("""\
-        import importlib.machinery
+        import importlib.machinery as machinery
         import importlib.util
         import json
+        import os
         import sys
+
+        LOADERS = [
+            (machinery.ExtensionFileLoader, machinery.EXTENSION_SUFFIXES),
+            (machinery.SourceFileLoader, machinery.SOURCE_SUFFIXES),
+            (machinery.SourcelessFileLoader, machinery.BYTECODE_SUFFIXES),
+        ]
+
+        def child(fullname, locations):
+            # FileFinder per directory: unlike PathFinder it never builds a
+            # _NamespacePath, which needs the parent package in sys.modules.
+            portions = []
+            for entry in locations:
+                if not os.path.isdir(entry):
+                    continue
+                spec = machinery.FileFinder(entry, *LOADERS).find_spec(fullname)
+                if spec is None:
+                    continue
+                if spec.loader is None and spec.submodule_search_locations:
+                    portions.extend(spec.submodule_search_locations)  # namespace portion
+                    continue
+                return True, spec.submodule_search_locations
+            return bool(portions), (portions or None)
 
         def locate(mod):
             parts = mod.split(".")
             spec = importlib.util.find_spec(parts[0])
             if spec is None:
                 return f"No module named '{parts[0]}'"
+            locations = spec.submodule_search_locations
+            locations = list(locations) if locations is not None else None
             name = parts[0]
             for part in parts[1:]:
-                locations = spec.submodule_search_locations
                 if locations is None:
                     return f"'{name}' is not a package, so '{mod}' cannot be imported"
                 name = f"{name}.{part}"
-                spec = importlib.machinery.PathFinder.find_spec(name, list(locations))
-                if spec is None:
+                found, locations = child(name, locations)
+                if not found:
                     return f"No module named '{name}'"
+                locations = list(locations) if locations is not None else None
             return None
 
         results = {}
