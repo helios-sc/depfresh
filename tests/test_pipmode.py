@@ -20,6 +20,7 @@ from depfresh.exceptions import CommandError, DirectReferenceError, PrivateIndex
 from depfresh.models import Vulnerability
 from depfresh.parsers import DependencyFormat
 from depfresh.pipmode import (
+    AmbiguousRequirementError,
     PipWorkspace,
     PyprojectDocument,
     RequirementsDocument,
@@ -246,6 +247,8 @@ class FakeResolver:
             if not code or code.startswith("-"):
                 continue
             req = Requirement(code)
+            if req.marker is not None and not req.marker.evaluate(ENV.marker_environment()):
+                continue
             name = normalise(req.name)
             direct[name] = direct.get(name, SpecifierSet()) & req.specifier
         prefs = parse_compile_output(preferences).pins if preferences else {}
@@ -493,3 +496,99 @@ class TestIgnoredDirectReferences:
                           DependencyFormat.REQUIREMENTS_SIMPLE, tmp_path / "work",
                           RemediationOptions(env=ENV), ignore_direct_references=True)
         assert ws.write(text).read_text() == "six==1.17.0\n"
+
+
+
+class TestMarkerSplitLines:
+    """The same package on several lines: edit the one that applies, or refuse."""
+
+    SPLIT = 'numpy==1.24.4; python_version < "3.9"\nnumpy==1.26.0; python_version >= "3.9"\n'
+
+    def test_only_the_applicable_line_is_edited(self) -> None:
+        doc = RequirementsDocument(self.SPLIT, env=ENV)
+        assert doc.listed() == {"numpy": "==1.26.0"}
+        doc.set_spec("numpy", "==1.26.4")
+        assert doc.render() == (
+            'numpy==1.24.4; python_version < "3.9"\nnumpy==1.26.4; python_version >= "3.9"\n'
+        )
+
+    def test_without_a_target_both_lines_apply(self) -> None:
+        with pytest.raises(AmbiguousRequirementError, match="lines 1, 2"):
+            RequirementsDocument(self.SPLIT).set_spec("numpy", "==1.26.4")
+
+    def test_case_variants_are_ambiguous(self) -> None:
+        doc = RequirementsDocument("Jinja2==3.1.2\njinja2==3.1.2\n", env=ENV)
+        assert "jinja2" in doc.ambiguous
+        assert "jinja2" not in doc.listed()
+        with pytest.raises(AmbiguousRequirementError):
+            doc.set_spec("jinja2", "==3.1.4")
+
+    def test_remediation_edits_the_line_that_ships(self, tmp_path: Path) -> None:
+        resolver = FakeResolver({"numpy": ["1.24.4", "1.26.0", "1.26.4"]}, {})
+        outcome = _remediate(tmp_path, self.SPLIT, resolver, {"numpy": {"1.26.0"}},
+                             {"numpy": "1.26.4"})
+        assert outcome.new_text == (
+            'numpy==1.24.4; python_version < "3.9"\nnumpy==1.26.4; python_version >= "3.9"\n'
+        )
+        assert outcome.post_vulns == []
+
+    def test_remediation_refuses_an_ambiguous_package(self, tmp_path: Path) -> None:
+        resolver = FakeResolver({"jinja2": ["3.1.2", "3.1.4"]}, {})
+        with pytest.raises(AmbiguousRequirementError):
+            _remediate(tmp_path, "Jinja2==3.1.2\njinja2==3.1.2\n", resolver,
+                       {"jinja2": {"3.1.2"}}, {"jinja2": "3.1.4"})
+        assert (tmp_path / "proj" / "requirements.txt").read_text() == (
+            "Jinja2==3.1.2\njinja2==3.1.2\n"
+        )
+
+    def test_latest_strategy_refuses_an_ambiguous_package(self, tmp_path: Path) -> None:
+        from depfresh.parsers import RequirementsSimpleHandler
+
+        req = tmp_path / "requirements.txt"
+        req.write_text("Jinja2==3.1.2\njinja2==3.1.2\nsix==1.16.0\n")
+        with pytest.raises(AmbiguousRequirementError):
+            RequirementsSimpleHandler().write({"jinja2": "3.1.4", "six": "1.17.0"}, req)
+        assert req.read_text() == "Jinja2==3.1.2\njinja2==3.1.2\nsix==1.16.0\n"
+
+
+class TestContinuationEdits:
+    def test_spec_on_a_continuation_line(self) -> None:
+        doc = RequirementsDocument("requests \\\n    >=2.0\nsix==1.16\n", env=ENV)
+        doc.set_spec("requests", ">=2.32.0")
+        assert doc.render() == "requests >=2.32.0\nsix==1.16\n"
+
+    def test_marker_on_a_hash_continuation_line_is_kept(self) -> None:
+        text = (
+            "pywin32==306 \\\n"
+            '    ; sys_platform == "linux" \\\n'
+            "    --hash=sha256:aaa\n"
+            "six==1.16.0 \\\n"
+            "    --hash=sha256:ccc\n"
+        )
+        doc = RequirementsDocument(text, env=ENV)
+        doc.set_spec("pywin32", "==311", ["sha256:new"])
+        assert doc.render() == (
+            'pywin32==311 ; sys_platform == "linux" \\\n'
+            "    --hash=sha256:new\n"
+            "six==1.16.0 \\\n"
+            "    --hash=sha256:ccc\n"
+        )
+
+    def test_comment_ending_in_backslash_keeps_the_next_entry(self) -> None:
+        text = (
+            "requests==2.25.0 \\\n"
+            "    --hash=sha256:aaa\n"
+            "idna==2.10  # pinned, see C:\\notes\\\n"
+            "urllib3==1.26.0 \\\n"
+            "    --hash=sha256:bbb\n"
+        )
+        doc = RequirementsDocument(text, env=ENV)
+        assert set(doc.listed()) == {"requests", "idna", "urllib3"}
+        doc.set_spec("idna", "==3.7", ["sha256:new1"])
+        assert doc.render() == (
+            "requests==2.25.0 \\\n"
+            "    --hash=sha256:aaa\n"
+            "idna==3.7  # pinned, see C:\\notes\\\n"
+            "urllib3==1.26.0 \\\n"
+            "    --hash=sha256:bbb\n"
+        )

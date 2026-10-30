@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import json
 import logging
+import sys
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -96,6 +97,21 @@ class TargetEnv:
             f"Unsupported platform {self.platform!r}; use one of "
             f"{', '.join(supported_platforms())}"
         )
+
+    @classmethod
+    def host(cls, python_version: str) -> TargetEnv:
+        """The machine depfresh runs on (``--strategy latest`` installs here)."""
+        import platform as _platform
+
+        machine = _platform.machine().lower()
+        arm = machine in ("arm64", "aarch64")
+        if sys.platform == "darwin":
+            name = "aarch64-apple-darwin" if arm else "x86_64-apple-darwin"
+        elif sys.platform == "win32":
+            name = "x86_64-pc-windows-msvc"
+        else:
+            name = "aarch64-unknown-linux-gnu" if arm else "x86_64-unknown-linux-gnu"
+        return cls(python_version, name)
 
     @property
     def python_minor(self) -> str:

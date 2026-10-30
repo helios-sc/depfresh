@@ -54,11 +54,14 @@ class RequirementsSimpleHandler:
             path.write_text("\n".join(lines) + "\n")
             log.debug("Wrote requirements: %s (%d packages)", path, len(lines))
             return
+        from depfresh.advisories import TargetEnv
         from depfresh.constraints import admit_version
-        from depfresh.pipmode import RequirementsDocument
+        from depfresh.pipmode import RequirementsDocument, check_unambiguous
 
         original = read_text_file(path)
-        doc = RequirementsDocument(original.text)
+        python = str(kwargs.get("python_version") or "3.11")
+        doc = RequirementsDocument(original.text, env=TargetEnv.host(python))
+        check_unambiguous(doc, [name for name in pkgs if name in doc.ambiguous])
         changed = 0
         for name, spec in doc.listed().items():
             new_ver = pkgs.get(name)

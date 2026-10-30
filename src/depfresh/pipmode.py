@@ -37,7 +37,7 @@ from typing import Any
 import tomlkit
 from packaging.requirements import InvalidRequirement, Requirement
 
-from depfresh.advisories import AdvisorySources, FixPlan
+from depfresh.advisories import AdvisorySources, FixPlan, TargetEnv, evaluate_marker
 from depfresh.constraints import admit_version, normalise
 from depfresh.exceptions import (
     CommandError,
@@ -57,6 +57,7 @@ from depfresh.remediation import (
     plan,
 )
 from depfresh.reqlines import (
+    COMMENT_RE,
     RequirementsTree,
     check_no_direct_references,
     inspect_tree,
@@ -192,21 +193,46 @@ def _code_part(line: str) -> str:
 
 @dataclass
 class _Entry:
+    """One registry requirement of a requirements file.
+
+    Attributes:
+        start, end: Physical line range (continuations included).
+        name: Normalised project name.
+        requirement: The logical requirement (name, extras, specifier, marker).
+        spec: Its specifier text.
+        marker: Its marker text, or ``None``.
+        options: Per-requirement options other than ``--hash``.
+        hashed: Whether the entry carries ``--hash`` options.
+    """
+
     start: int
     end: int
     name: str
+    requirement: str
     spec: str
-    span: tuple[int, int]
+    marker: str | None
+    options: str
     hashed: bool
 
 
-class RequirementsDocument:
-    """A requirements file that can be edited one requirement at a time."""
+class AmbiguousRequirementError(DepfreshError):
+    """Raised when a package to edit is listed on several lines that all apply."""
 
-    def __init__(self, text: str) -> None:
+
+class RequirementsDocument:
+    """A requirements file that can be edited one requirement at a time.
+
+    With *env*, an entry whose marker is false for that target is left alone,
+    and editing a package that several applicable lines list is refused
+    (:class:`AmbiguousRequirementError`): depfresh would have to guess which
+    line ships.
+    """
+
+    def __init__(self, text: str, env: TargetEnv | None = None) -> None:
         self.lines = text.splitlines(keepends=True)
         self.newline = "\r\n" if self.lines and self.lines[0].endswith("\r\n") else "\n"
-        self.entries: dict[str, _Entry] = {}
+        self.env = env
+        self.all_entries: list[_Entry] = []
         self.direct_refs: list[str] = []
         self.appended: list[str] = []
         self._parse()
@@ -218,55 +244,111 @@ class RequirementsDocument:
                 continue
             if line.kind != "registry":
                 continue
-            first = self.lines[line.start]
-            code = _code_part(first)
-            split = split_requirement(code)
+            requirement = line.requirement
+            split = split_requirement(requirement)
             if split is None:
                 continue
             name, s, e = split
-            logical = " ".join(x.rstrip("\r\n") for x in self.lines[line.start:line.end + 1])
-            self.entries.setdefault(normalise(name), _Entry(
-                line.start, line.end, normalise(name), code[s:e], (s, e), "--hash" in logical,
+            marker = requirement.split(";", 1)[1].strip() if ";" in requirement[e:] else None
+            options = line.code[line.code.find(requirement) + len(requirement):].strip()
+            other = " ".join(t for t in re.split(r"\s+(?=--)", options)
+                             if t and not t.startswith("--hash"))
+            self.all_entries.append(_Entry(
+                line.start, line.end, normalise(name), requirement, requirement[s:e], marker,
+                other, "--hash" in options,
             ))
 
+    def _applies(self, entry: _Entry) -> bool:
+        return self.env is None or evaluate_marker(entry.marker, self.env)
+
+    def entries_for(self, name: str) -> list[_Entry]:
+        """Every entry of *name* whose marker holds on the target."""
+        key = normalise(name)
+        return [e for e in self.all_entries if e.name == key and self._applies(e)]
+
+    @property
+    def ambiguous(self) -> dict[str, list[int]]:
+        """``{name: [line numbers]}`` for packages several applicable lines list."""
+        seen: dict[str, list[int]] = {}
+        for entry in self.all_entries:
+            if self._applies(entry):
+                seen.setdefault(entry.name, []).append(entry.start + 1)
+        return {name: lines for name, lines in seen.items() if len(lines) > 1}
+
+    @property
+    def entries(self) -> dict[str, _Entry]:
+        """The single applicable entry of every unambiguous package."""
+        ambiguous = self.ambiguous
+        out: dict[str, _Entry] = {}
+        for entry in self.all_entries:
+            if self._applies(entry) and entry.name not in ambiguous:
+                out.setdefault(entry.name, entry)
+        return out
+
     def listed(self) -> dict[str, str]:
-        """``{name: specifier}`` of the registry requirements in the file."""
+        """``{name: specifier}`` of the applicable, unambiguous requirements."""
         return {name: entry.spec for name, entry in self.entries.items()}
+
+    def entry(self, name: str) -> _Entry:
+        """The one applicable entry of *name*.
+
+        Raises:
+            AmbiguousRequirementError: When several applicable lines list it.
+            KeyError: When none does.
+        """
+        found = self.entries_for(name)
+        if len(found) > 1:
+            lines = ", ".join(str(e.start + 1) for e in found)
+            raise AmbiguousRequirementError(
+                f"{normalise(name)} is listed on lines {lines} and more than one applies to "
+                f"the target; depfresh will not guess which one ships. Merge them, or make "
+                "their markers exclusive."
+            )
+        if not found:
+            raise KeyError(name)
+        return found[0]
 
     def set_spec(self, name: str, spec: str, hashes: list[str] | None = None) -> None:
         """Replace the specifier of *name* (and its ``--hash`` lines when given)."""
-        entry = self.entries[normalise(name)]
-        line = self.lines[entry.start]
-        s, e = entry.span
-        new_first = line[:s] + spec + line[e:]
+        entry = self.entry(name)
+        first = self.lines[entry.start]
+        newline = self.newline if first.endswith(("\n", "\r")) else ""
+        if entry.start == entry.end and not (entry.hashed and hashes is not None):
+            code = _code_part(first)
+            split = split_requirement(code)
+            if split is not None:
+                _, s, e = split
+                self.lines[entry.start] = first[:s] + spec + first[e:]
+                entry.spec = spec
+                return
+        indent = first[:len(first) - len(first.lstrip())]
+        _, s, e = split_requirement(entry.requirement) or ("", 0, 0)
+        requirement = re.sub(r"\s+", " ", entry.requirement[:s] + spec + entry.requirement[e:])
+        requirement = re.sub(r"\s*;\s*", " ; ", requirement)
+        last = self.lines[entry.end].rstrip("\r\n")
+        comment_match = COMMENT_RE.search(last)
+        comment = comment_match.group(0) if comment_match else ""
+        options = f" {entry.options}" if entry.options else ""
         if entry.hashed and hashes is not None:
-            head = _code_part(new_first)
-            comment = ""
-            match = re.search(r"\s#.*$", new_first.rstrip("\r\n"))
-            if match and "--hash" not in match.group(0):
-                comment = match.group(0)
-            block = [f"{head}{comment} \\{self.newline}"]
+            block = [f"{indent}{requirement}{options} \\{self.newline}"]
             for j, digest in enumerate(hashes):
-                cont = " \\" if j < len(hashes) - 1 else ""
+                cont = " \\" if j < len(hashes) - 1 else comment
                 block.append(f"    --hash={digest}{cont}{self.newline}")
-            if not self.lines[entry.end].endswith(("\n", "\r")):
-                block[-1] = block[-1].rstrip("\r\n")
-            self.lines[entry.start:entry.end + 1] = block
-            delta = len(block) - (entry.end - entry.start + 1)
-            self._shift(entry.start, delta)
-            entry.end = entry.start + len(block) - 1
         else:
-            self.lines[entry.start] = new_first
-        entry.spec = spec
-        entry.span = (s, s + len(spec))
-
-    def _shift(self, after: int, delta: int) -> None:
-        if not delta:
-            return
-        for other in self.entries.values():
-            if other.start > after:
+            block = [f"{indent}{requirement}{options}{comment}{self.newline}"]
+        if not newline:
+            block[-1] = block[-1].rstrip("\r\n")
+        if not self.lines[entry.end].endswith(("\n", "\r")):
+            block[-1] = block[-1].rstrip("\r\n")
+        delta = len(block) - (entry.end - entry.start + 1)
+        self.lines[entry.start:entry.end + 1] = block
+        for other in self.all_entries:
+            if other.start > entry.start:
                 other.start += delta
                 other.end += delta
+        entry.end = entry.start + len(block) - 1
+        entry.requirement = requirement
+        entry.spec = spec
 
     def append(self, line: str) -> None:
         """Add *line* at the end of the file."""
@@ -284,7 +366,10 @@ class RequirementsDocument:
 class PyprojectDocument:
     """``[project]`` dependencies of a pyproject.toml, edited with tomlkit."""
 
-    def __init__(self, text: str, extras: Iterable[str], all_extras: bool) -> None:
+    def __init__(
+        self, text: str, extras: Iterable[str], all_extras: bool, env: TargetEnv | None = None,
+    ) -> None:
+        self.env = env
         self.doc = tomlkit.parse(text)
         self.extras = list(extras)
         self.all_extras = all_extras
@@ -306,12 +391,21 @@ class PyprojectDocument:
                     continue
 
     def _items(self) -> list[tuple[Any, int, str]]:
+        """Requirement strings whose marker holds on the target (all, without a target)."""
         found = []
         for _, array in self.arrays:
             for i, item in enumerate(array):
                 text = str(item)
-                if split_requirement(text) is not None:
-                    found.append((array, i, text))
+                if split_requirement(text) is None:
+                    continue
+                if self.env is not None:
+                    try:
+                        marker = Requirement(text).marker
+                    except InvalidRequirement:
+                        continue
+                    if not evaluate_marker(str(marker) if marker else None, self.env):
+                        continue
+                found.append((array, i, text))
         return found
 
     def listed(self) -> dict[str, str]:
@@ -401,8 +495,16 @@ def open_document(
     fmt: DependencyFormat, text: str, options: RemediationOptions,
 ) -> RequirementsDocument | PyprojectDocument:
     if fmt == DependencyFormat.PYPROJECT_PEP621:
-        return PyprojectDocument(text, options.extras, options.all_extras)
-    return RequirementsDocument(text)
+        return PyprojectDocument(text, options.extras, options.all_extras, env=options.env)
+    return RequirementsDocument(text, env=options.env)
+
+
+def check_unambiguous(doc: RequirementsDocument | PyprojectDocument, names: Iterable[str]) -> None:
+    """Refuse to edit a package that several applicable lines list."""
+    if isinstance(doc, RequirementsDocument):
+        for name in names:
+            if normalise(name) in doc.ambiguous:
+                doc.entry(name)  # raises AmbiguousRequirementError
 
 
 # ---------------------------------------------------------------------------
@@ -797,6 +899,7 @@ def _plan_edits(
     notes: list[str],
 ) -> None:
     """Choose the manifest edits for *targets*, with minimal co-upgrades if needed."""
+    check_unambiguous(doc, targets)
     listed = doc.listed()
 
     def edits_for(names: Iterable[str]) -> tuple[dict[str, str], dict[str, tuple[str, str]]]:
@@ -880,6 +983,7 @@ def _with_cobumps(
         )
         return False
     new_edits = dict(candidate_edits)
+    check_unambiguous(open_document(fmt, original, options), (c.name for c in cobumps))
     for change in cobumps:
         if change.name in listed and _is_pin(listed[change.name]):
             new_edits[change.name] = f"=={change.new_version}"
