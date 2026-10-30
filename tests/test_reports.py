@@ -180,4 +180,4 @@ class TestAccurateSummary:
     def test_unwritten_diff_is_labelled(self, tmp_path: Path) -> None:
         report = _make_report(manifest_diff="-a\n+b\n", dry_run=True)
         content = write_markdown(report, tmp_path, "2026-01-15").read_text()
-        assert "Not written (no (dry-run)); the change would be:" in content
+        assert "(not written (dry run)); the change would be:" in content

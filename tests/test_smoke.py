@@ -211,3 +211,53 @@ class TestLiveIntegration:
 
         # Verify the original file was NOT modified (dry-run)
         assert (project_dir / "requirements.txt").read_text() == "idna==3.6\npackaging==23.1\n"
+
+
+@pytest.mark.skipif(not _has_uv(), reason="uv not installed")
+class TestLiveLockAware:
+    """Lock-aware mode against a real uv project: the fix lands in uv.lock."""
+
+    def test_fixes_a_vulnerable_lock(
+        self,
+        installed_venv: tuple[Path, str, str],
+        tmp_path: Path,
+    ) -> None:
+        if sys.version_info >= (3, 11):
+            import tomllib
+        else:
+            import tomli as tomllib
+        from packaging.version import Version
+
+        _, _, depfresh_bin = installed_venv
+        uv = shutil.which("uv")
+        assert uv is not None
+        project = tmp_path / "lock_project"
+        project.mkdir()
+        pyproject = (
+            '[project]\nname = "smoke-lock"\nversion = "0.1.0"\n'
+            'requires-python = ">=3.10"\ndependencies = ["idna>=3.0"]\n\n'
+            "[tool.uv]\npackage = false\n"
+        )
+        (project / "pyproject.toml").write_text(pyproject)
+        for args in (["lock"], ["lock", "--upgrade-package", "idna==3.6"]):
+            done = subprocess.run(
+                [uv, *args], cwd=project, capture_output=True, text=True, timeout=120,
+            )
+            assert done.returncode == 0, done.stderr
+
+        result = subprocess.run(
+            [depfresh_bin, str(project), "--python", _PYTHON_VERSION,
+             "--reports-dir", str(tmp_path / "reports"), "--label", "smoke_lock"],
+            capture_output=True, text=True, timeout=600,
+        )
+        assert result.returncode == 0, f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        assert "Mode:         lock (minimal)" in result.stdout
+
+        lock = tomllib.loads((project / "uv.lock").read_text())
+        idna = next(p for p in lock["package"] if p["name"] == "idna")
+        assert Version(idna["version"]) > Version("3.6")
+        assert (project / "pyproject.toml").read_text() == pyproject
+        check = subprocess.run(
+            [uv, "lock", "--check"], cwd=project, capture_output=True, text=True, timeout=120,
+        )
+        assert check.returncode == 0, check.stderr

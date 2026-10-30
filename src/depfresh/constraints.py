@@ -60,6 +60,68 @@ def classify_bump(old: str, new: str) -> str:
     return "patch"
 
 
+def admit_version(specifier: str, target: str) -> str:
+    """Rewrite a PEP 440 *specifier* so that it admits *target* as its floor.
+
+    Used to raise a floor for a security fix while keeping the rest of the
+    user's intent:
+
+    * an exact pin (``==X``/``===X``) becomes ``==target``;
+    * floors (``>=``, ``>``, ``~=``) become ``>=target``; the upper bound
+      implied by ``~=`` is kept when *target* is below it;
+    * upper bounds and ``!=`` exclusions that admit *target* are kept; an upper
+      bound that excludes it (a major-version cap the fix must cross) becomes
+      ``<{target.major + 1}``;
+    * a specifier with no floor gains ``>=target``.
+
+    Examples::
+
+        admit_version("==2.6.3", "2.8.0")        -> "==2.8.0"
+        admit_version(">=2.10.0", "3.17.1")      -> ">=3.17.1"
+        admit_version(">=6.21,<7", "6.25.0")     -> ">=6.25.0,<7"
+        admit_version(">=41,<47", "50.0.2")      -> ">=50.0.2,<51"
+        admit_version("", "2.8.0")               -> ">=2.8.0"
+    """
+    from packaging.specifiers import InvalidSpecifier, Specifier
+    from packaging.version import Version
+
+    tv = Version(target)
+    clauses = [c.strip() for c in specifier.split(",") if c.strip()]
+    kept: list[str] = []
+    for clause in clauses:
+        try:
+            spec = Specifier(clause)
+        except InvalidSpecifier:
+            kept.append(clause)
+            continue
+        op, ver = spec.operator, spec.version
+        if op in ("==", "===") and "*" not in ver:
+            return f"=={target}"
+        if op in (">=", ">"):
+            continue
+        if op == "~=":
+            parts = ver.split(".")
+            upper_parts = parts[:-1] if len(parts) > 1 else parts
+            upper_parts = [*upper_parts[:-1], str(int(upper_parts[-1]) + 1)]
+            upper = ".".join(upper_parts)
+            if tv < Version(upper):
+                kept.append(f"<{upper}")
+            continue
+        if spec.contains(tv, prereleases=True):
+            kept.append(clause)
+        elif op in ("<", "<="):
+            kept.append(f"<{tv.major + 1}")
+        elif op == "!=":
+            continue
+        else:  # wildcard pin that excludes the target
+            continue
+    deduped: list[str] = []
+    for clause in kept:
+        if clause not in deduped:
+            deduped.append(clause)
+    return ",".join([f">={target}", *deduped])
+
+
 def build_constraints(
     pkgs: dict[str, str],
     *,

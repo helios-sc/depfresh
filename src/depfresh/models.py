@@ -86,6 +86,34 @@ class PackageChange:
 
 
 @dataclass
+class PlannedFix:
+    """One vulnerable package and what depfresh did (or could not do) about it.
+
+    Attributes:
+        package: Normalised name.
+        current: Version before remediation.
+        target: Lowest release that fixes every advisory (``None`` when none
+            was chosen, see *status*).
+        status: ``"applied"``, ``"needs-major"``, ``"kept"``, ``"no-fix"``,
+            ``"private"``, ``"blocked"`` (a fix exists but could not be
+            resolved) or ``"planned"`` (dry runs and audit-only runs).
+        kind: Version change class (``"patch"``, ``"minor"``, ``"major"``…).
+        reason: Human-readable explanation.
+        advisories: Display ids of the advisories involved.
+        final: Version shipped after remediation.
+    """
+
+    package: str
+    current: str
+    target: str | None
+    status: str
+    kind: str = ""
+    reason: str = ""
+    advisories: list[str] = field(default_factory=list)
+    final: str | None = None
+
+
+@dataclass
 class ImportCheck:
     """Results from verifying third-party imports against the upgraded environment."""
 
@@ -136,6 +164,30 @@ class UpgradeResult:
 
     original_count: int = 0
     final_count: int = 0
+
+    #: ``"lock"`` (uv.lock), ``"requirements"``/``"pyproject"`` (resolved for
+    #: the deploy platform) or ``"legacy"`` (``--strategy latest``).
+    mode: str = "legacy"
+    #: ``"minimal"`` (only vulnerable packages move) or ``"latest"``.
+    strategy: str = "latest"
+    #: Target platform the shipped set was resolved/evaluated for.
+    platform: str = ""
+    extras: list[str] = field(default_factory=list)
+    groups: list[str] = field(default_factory=list)
+    fixes: list[PlannedFix] = field(default_factory=list)
+    #: Every package version change in uv.lock (all groups, all platforms).
+    lock_changes: list[PackageChange] = field(default_factory=list)
+    #: ``"passed"``, ``"failed: …"`` or ``""`` when not applicable.
+    lock_check: str = ""
+    #: Fresh resolution of the written manifest for the target platform.
+    resolution_check: str = ""
+    #: Packages in the shipped set that were not audited, with the reason.
+    not_audited: list[str] = field(default_factory=list)
+    #: The commands depfresh ran to change the dependency files.
+    commands: list[str] = field(default_factory=list)
+    #: Files written (or that would be written on a dry run).
+    files_changed: list[str] = field(default_factory=list)
+    notes: list[str] = field(default_factory=list)
 
     log_path: str | None = None
     markdown_path: str | None = None

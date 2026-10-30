@@ -77,3 +77,22 @@ class DirectReferenceError(DepfreshError):
             f"{path}: {joined}. Re-run with --ignore-direct-references "
             "to skip them."
         )
+
+
+class PrivateIndexError(DepfreshError):
+    """Raised when uv cannot reach a non-PyPI package index.
+
+    depfresh never falls back to public PyPI for a package that belongs to a
+    private index: that would be a dependency-confusion exposure.
+    """
+
+    def __init__(self, url: str, detail: str = "") -> None:
+        self.url = url
+        self.detail = detail
+        tail = f"\n{detail.strip()[-500:]}" if detail.strip() else ""
+        super().__init__(
+            f"Could not reach the package index {url}. depfresh does not fall back to "
+            "public PyPI for packages from a private index; make the index reachable "
+            "(network access, keyring or UV_INDEX_<NAME>_USERNAME/PASSWORD credentials) "
+            f"and re-run.{tail}"
+        )

@@ -11,7 +11,7 @@ from depfresh.constraints import (
     format_keep_version,
     normalise,
 )
-from depfresh.models import UpgradeResult
+from depfresh.models import PlannedFix, UpgradeResult
 from depfresh.uv import compile_hashed
 
 log = logging.getLogger("depfresh")
@@ -59,9 +59,15 @@ def write_log(report: UpgradeResult, out_dir: Path, date_prefix: str) -> Path:
         f"Allow-major: {format_allow_major(report.allow_major)}",
         f"Keep-version: {format_keep_version(report.keep_version)}",
         f"Dry-run: {'yes' if report.dry_run else 'no'}",
-        sep, "",
-        "== PRE-UPGRADE VULNERABILITY AUDIT " + "=" * 44, "",
+        f"Mode: {report.mode} ({report.strategy})",
     ]
+    if report.platform:
+        lines.append(f"Target: {report.platform}, Python {report.python_version}")
+    if report.extras:
+        lines.append(f"Extras: {', '.join(report.extras)}")
+    if report.groups:
+        lines.append(f"Groups: {', '.join(report.groups)}")
+    lines += [sep, "", "== PRE-UPGRADE VULNERABILITY AUDIT " + "=" * 44, ""]
 
     if report.pre_audit_vulns:
         lines.append(
@@ -75,6 +81,31 @@ def write_log(report: UpgradeResult, out_dir: Path, date_prefix: str) -> Path:
             lines.append(f"{v.package:<25} {v.version:<12} {v.cve:<18} {v.fix_versions:<20}")
     else:
         lines.append("No vulnerabilities found.")
+
+    if report.fixes:
+        lines += ["", "", "== SECURITY FIXES " + "=" * 61, ""]
+        for f in report.fixes:
+            lines.append(
+                f"  {f.package:<28} {f.current:<12} -> {(f.final or f.target or '-'):<12} "
+                f"[{f.status}] {f.reason}"
+            )
+    if report.commands:
+        lines += ["", "", "== COMMANDS " + "=" * 67, ""]
+        lines += [f"  {c}" for c in report.commands]
+    if report.lock_changes:
+        lines += ["", "", "== UV.LOCK CHANGES " + "=" * 60, ""]
+        for c in report.lock_changes:
+            lines.append(f"  {c.name:<35} {c.old_version:<15} -> {c.new_version}")
+    if report.lock_check:
+        lines.append(f"uv lock --check: {report.lock_check}")
+    if report.resolution_check:
+        lines.append(f"Fresh resolution: {report.resolution_check}")
+    if report.not_audited:
+        lines += ["", "", "== NOT AUDITED " + "=" * 64, ""]
+        lines += [f"  {line}" for line in report.not_audited]
+    if report.notes:
+        lines += ["", "", "== NOTES " + "=" * 70, ""]
+        lines += [f"  {note}" for note in report.notes]
 
     lines += ["", "", "== UPGRADED PACKAGES " + "=" * 58, ""]
     lines.append(f"{'Package':<35} {'Old':<15} {'New':<15} {'Note'}")
@@ -185,10 +216,21 @@ def write_log(report: UpgradeResult, out_dir: Path, date_prefix: str) -> Path:
 def _write_back_status(report: UpgradeResult) -> str:
     """One-line description of whether (and why not) the dependency file was written."""
     if report.dep_file_updated:
-        return report.requirements_path
+        return ", ".join(report.files_changed) or report.requirements_path
     if report.write_back_skipped:
         return f"no ({report.write_back_skipped})"
+    if not report.files_changed and not report.manifest_diff:
+        return "no (nothing to change)"
     return f"no ({'dry-run' if report.dry_run else 'not written'})"
+
+
+def _write_state(report: UpgradeResult) -> str:
+    """``written`` / ``not written (dry run)`` / ``not written: <reason>``."""
+    if report.dep_file_updated:
+        return "written"
+    if report.write_back_skipped:
+        return f"not written: {report.write_back_skipped}"
+    return "not written (dry run)" if report.dry_run else "not written"
 
 
 # ---------------------------------------------------------------------------
@@ -203,12 +245,18 @@ def write_markdown(report: UpgradeResult, out_dir: Path, date_prefix: str) -> Pa
     _md_header(md, report)
     _md_summary(md, report)
     _md_files_changed(md, report)
-    _md_steps(md, report)
+    if report.mode == "legacy":
+        _md_steps(md, report)
+    else:
+        _md_commands(md, report)
+    _md_fixes(md, report)
     _md_vulnerability_tables(md, report)
     _md_upgraded_packages(md, report)
     _md_new_deps(md, report)
+    _md_not_audited(md, report)
     _md_ignored_direct_refs(md, report)
     _md_import_verification(md, report)
+    _md_notes(md, report)
     _md_checklist(md, report)
 
     path.write_text("\n".join(md) + "\n")
@@ -230,8 +278,15 @@ def _md_header(md: list[str], report: UpgradeResult) -> None:
     md.append(f"**Date:** {report.date}")
     md.append(f"**Service:** `{report.service_label}`")
     md.append(f"**Python:** {report.python_version}")
+    if report.platform:
+        md.append(f"**Target platform:** `{report.platform}`")
+    md.append(f"**Mode:** {_mode_description(report)}")
     md.append(f"**Tool:** uv {report.uv_version} + pip-audit {report.pip_audit_version}")
     md.append(f"**Dependency scope:** `{report.dependency_scope}`")
+    if report.extras:
+        md.append(f"**Extras:** {', '.join(report.extras)}")
+    if report.groups:
+        md.append(f"**Dependency groups:** {', '.join(report.groups)}")
     md.append(
         f"**Ignore direct references:** "
         f"{'yes' if report.ignore_direct_references else 'no'}"
@@ -278,19 +333,181 @@ def _change_summary(report: UpgradeResult) -> str:
     return "; ".join(parts) + "."
 
 
+def _mode_description(report: UpgradeResult) -> str:
+    if report.mode == "lock":
+        return "lock-aware (audits and fixes `uv.lock`), vulnerable packages only"
+    if report.mode in ("requirements", "pyproject"):
+        return (
+            f"resolved for the deploy platform ({report.requirements_path}), "
+            "vulnerable packages only"
+        )
+    return "latest (every package upgraded within its bounds, resolved on this machine)"
+
+
 def _md_files_changed(md: list[str], report: UpgradeResult) -> None:
-    """Show the dependency-file diff exactly as written (or as it would be written)."""
+    """Show the dependency-file changes exactly as written (or as they would be)."""
     md.append("## Files Changed")
     md.append("")
+    state = _write_state(report)
+    if report.mode == "lock":
+        if report.lock_changes:
+            md.append(
+                f"`uv.lock` ({state}): {len(report.lock_changes)} package version(s) change, "
+                "across every group and platform in the lock:"
+            )
+            md.append("")
+            _md_table(
+                md,
+                ["Package", "Locked before", "Locked after", "Bump"],
+                [
+                    [c.name, c.old_version, c.new_version,
+                     _bump_label(c.old_version, c.new_version)]
+                    for c in report.lock_changes
+                ],
+            )
+        else:
+            md.append("`uv.lock`: no changes.")
+        md.append("")
+        if report.manifest_diff:
+            md.append(f"`pyproject.toml` ({state}):")
+            md.append("")
+            md.append("```diff")
+            md.append(report.manifest_diff.rstrip("\n"))
+            md.append("```")
+        else:
+            md.append("`pyproject.toml`: no changes.")
+        md.append("")
+        md.append("---")
+        md.append("")
+        return
     if not report.manifest_diff:
         md.append(f"`{report.requirements_path}`: no changes.")
     else:
         if not report.dep_file_updated:
-            md.append(f"Not written ({_write_back_status(report)}); the change would be:")
+            md.append(f"`{report.requirements_path}` ({state}); the change would be:")
             md.append("")
         md.append("```diff")
         md.append(report.manifest_diff.rstrip("\n"))
         md.append("```")
+    md.append("")
+    md.append("---")
+    md.append("")
+
+
+def _bump_label(old: str, new: str) -> str:
+    """Bump kind, upper-cased when it crosses a major version."""
+    kind = classify_bump(old.split(",")[0].strip(), new.split(",")[0].strip())
+    return "**MAJOR**" if kind == "major" else kind
+
+
+def _md_commands(md: list[str], report: UpgradeResult) -> None:
+    """Steps of a minimal run: the commands that produced the changes."""
+    md.append("## Steps Performed")
+    md.append("")
+    if report.mode == "lock":
+        md.append(
+            "1. Exported the locked set that ships and evaluated its markers for "
+            f"`{report.platform}` / Python {report.python_version}:"
+        )
+        md.append("   `uv export --frozen --no-emit-project --no-hashes "
+                  + _group_flags(report) + "`")
+    else:
+        md.append(
+            f"1. Resolved `{report.requirements_path}` for the deploy platform: "
+            f"`uv pip compile --python-platform {report.platform} "
+            f"--python-version {report.python_version}`"
+        )
+    md.append(
+        f"2. Audited it: `pip-audit -r <pinned set> --no-deps --disable-pip -s osv` "
+        f"({len(report.pre_audit_vulns)} advisories)."
+    )
+    md.append(
+        "3. Planned the lowest release that fixes every advisory of each vulnerable package "
+        "(OSV affected ranges, PyPI releases)."
+    )
+    md.append("4. Applied the plan:")
+    md.append("")
+    md.append("```bash")
+    md.extend(report.commands or ["# nothing to change"])
+    md.append("```")
+    md.append("")
+    md.append(
+        f"5. Re-audited what would ship: **{len(report.post_audit_vulns)}** advisories remain."
+    )
+    md.append("")
+    md.append("---")
+    md.append("")
+
+
+def _group_flags(report: UpgradeResult) -> str:
+    flags = []
+    if report.groups == ["(all)"]:
+        flags.append("--all-groups")
+    elif report.groups and report.groups != ["(no dev)"]:
+        flags.append("--no-default-groups " + " ".join(f"--group {g}" for g in report.groups))
+    else:
+        flags.append("--no-dev")
+    if report.extras == ["(all)"]:
+        flags.append("--all-extras")
+    else:
+        flags += [f"--extra {e}" for e in report.extras]
+    return " ".join(flags)
+
+
+def _md_fixes(md: list[str], report: UpgradeResult) -> None:
+    """One row per vulnerable package: plan, outcome and why."""
+    if not report.fixes:
+        return
+    md.append(f"## Security Fixes ({len(report.fixes)} vulnerable packages)")
+    md.append("")
+    _md_table(
+        md,
+        ["Package", "From", "To", "Bump", "Advisories", "Status", "Note"],
+        [
+            [
+                f.package,
+                f.current,
+                _fix_to(f),
+                _bump_label(f.current, _fix_to(f)) if _fix_to(f) != "-" else "-",
+                ", ".join(f.advisories[:6]) + (f" (+{len(f.advisories) - 6})"
+                                               if len(f.advisories) > 6 else ""),
+                f.status,
+                f.reason.replace("|", "/"),
+            ]
+            for f in report.fixes
+        ],
+    )
+    md.append("")
+    md.append("---")
+    md.append("")
+
+
+def _fix_to(fix: PlannedFix) -> str:
+    """The version a fix moved to, or (not applied) the version it would need."""
+    if fix.status == "applied" and fix.final:
+        return fix.final
+    return fix.target or "-"
+
+
+def _md_not_audited(md: list[str], report: UpgradeResult) -> None:
+    if not report.not_audited:
+        return
+    md.append(f"## Not Audited ({len(report.not_audited)})")
+    md.append("")
+    for line in report.not_audited:
+        md.append(f"- `{line}`")
+    md.append("")
+    md.append("---")
+    md.append("")
+
+
+def _md_notes(md: list[str], report: UpgradeResult) -> None:
+    if not report.notes:
+        return
+    md.append("## Notes")
+    md.append("")
+    for note in report.notes:
+        md.append(f"- {note}")
     md.append("")
     md.append("---")
     md.append("")
@@ -351,17 +568,19 @@ def _md_vulnerability_tables(md: list[str], report: UpgradeResult) -> None:
             f"({len(report.pre_audit_vulns)} total)"
         )
         md.append("")
-        vuln_fix_map = {
+        vuln_fix_map = {f.package: _fix_to(f) for f in report.fixes}
+        vuln_fix_map.update({
             normalise(p.name): p.new_version
             for p in report.upgraded if p.is_security_fix
-        }
+        })
         _md_table(
             md,
-            ["Package", "Old Version", "New Version", "CVE"],
+            ["Package", "Old Version", "New Version", "CVE", "GHSA"],
             [
                 [
                     v.package, v.version,
-                    vuln_fix_map.get(normalise(v.package), v.fix_versions), v.cve,
+                    vuln_fix_map.get(normalise(v.package), v.fix_versions or "-"), v.cve,
+                    v.ghsa if v.ghsa != v.cve else "",
                 ]
                 for v in report.pre_audit_vulns
             ],
@@ -392,11 +611,28 @@ def _md_vulnerability_tables(md: list[str], report: UpgradeResult) -> None:
 def _md_upgraded_packages(md: list[str], report: UpgradeResult) -> None:
     md.append("## All Upgraded Packages")
     md.append("")
-    _md_table(
-        md,
-        ["Package", "Old Version", "New Version"],
-        [[p.name, p.old_version, p.new_version] for p in report.upgraded],
-    )
+    if report.mode == "legacy":
+        _md_table(
+            md,
+            ["Package", "Old Version", "New Version"],
+            [[p.name, p.old_version, p.new_version] for p in report.upgraded],
+        )
+    else:
+        md.append(
+            "Version changes in the shipped set. Packages without an advisory moved only "
+            "because a fix required it."
+        )
+        md.append("")
+        _md_table(
+            md,
+            ["Package", "Old Version", "New Version", "Bump", "Why"],
+            [
+                [p.name, p.old_version, p.new_version,
+                 _bump_label(p.old_version, p.new_version),
+                 "security fix" if p.is_security_fix else "required by a fix"]
+                for p in report.upgraded
+            ],
+        )
     md.append("")
     md.append("---")
     md.append("")
@@ -510,7 +746,25 @@ def _md_checklist(md: list[str], report: UpgradeResult) -> None:
     md.append(
         f"- [x] Pre-upgrade audit: {len(report.pre_audit_vulns)} vulnerabilities identified"
     )
-    md.append("- [x] Selected packages upgraded within configured version bounds")
+    if report.mode == "legacy":
+        md.append("- [x] Selected packages upgraded within configured version bounds")
+    else:
+        moved = {p.name for p in report.upgraded}
+        vulnerable = {normalise(v.package) for v in report.pre_audit_vulns}
+        md.append(
+            f"- [x] Only vulnerable packages moved ({len(moved & vulnerable)}), plus "
+            f"{len(moved - vulnerable)} required co-upgrade(s)"
+        )
+        majors = [p.name for p in report.upgraded
+                  if classify_bump(p.old_version, p.new_version) == "major"]
+        if majors:
+            md.append(f"- [ ] Review the major version changes: {', '.join(sorted(majors))}")
+    if report.lock_check:
+        mark = "x" if report.lock_check == "passed" else " "
+        md.append(f"- [{mark}] `uv lock --check`: {report.lock_check}")
+    if report.resolution_check:
+        mark = "x" if report.resolution_check.startswith("passed") else " "
+        md.append(f"- [{mark}] Fresh resolution for `{report.platform}`: {report.resolution_check}")
     if report.dep_file_updated:
         md.append(f"- [x] Dependency file updated ({report.final_count} packages)")
     else:

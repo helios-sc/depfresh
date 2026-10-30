@@ -23,21 +23,38 @@ log = logging.getLogger("depfresh")
 # Shell helper
 # ---------------------------------------------------------------------------
 
+#: uv settings from the caller's environment that would change what depfresh
+#: asks uv to do (``uv lock`` under ``UV_FROZEN`` does nothing, ``uv sync``
+#: under ``UV_PROJECT_ENVIRONMENT`` targets the user's venv…).
+_UV_ENV_OVERRIDES = (
+    "UV_FROZEN", "UV_LOCKED", "UV_NO_SYNC", "UV_PROJECT_ENVIRONMENT", "UV_NO_DEV",
+    "UV_NO_DEFAULT_GROUPS", "UV_DEV", "UV_RESOLUTION", "UV_UPGRADE",
+)
+
+
+def uv_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment for uv subprocesses: the caller's, minus overriding UV_* settings."""
+    env = {k: v for k, v in os.environ.items() if k not in _UV_ENV_OVERRIDES}
+    env.update(extra or {})
+    return env
+
+
 def run(
     cmd: list[str],
     *,
-    cwd: str | None = None,
+    cwd: str | Path | None = None,
     check: bool = True,
-    timeout: int = 600,
+    timeout: int = 1800,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command and return the result.
 
     Raises :class:`CommandError` when *check* is True and the command exits
     with a non-zero return code.
     """
-    log.debug("$ %s", " ".join(cmd))
+    log.debug("$ %s%s", " ".join(cmd), f"  (in {cwd})" if cwd else "")
     result = subprocess.run(
-        cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout,
+        cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout, env=env,
     )
     if check and result.returncode != 0:
         log.debug("STDERR: %s", result.stderr.strip())

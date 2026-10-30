@@ -388,3 +388,42 @@ class TestRunAudit:
         with patch("depfresh.audit.run", return_value=mock_result):
             with pytest.raises(AuditError, match="invalid JSON"):
                 run_audit("/venv/bin/python", req, "test")
+
+
+class TestChunkedAudit:
+    def test_large_sets_are_split_and_merged(self, tmp_path: Path) -> None:
+        """Every pin is audited, across parallel pip-audit processes."""
+        req = tmp_path / "pins.txt"
+        names = [f"pkg{i:02d}" for i in range(40)]
+        req.write_text("".join(f"{n}==1.0\n" for n in names))
+        seen: list[str] = []
+
+        def fake_run(cmd: list[str], check: bool = True) -> MagicMock:
+            path = Path(cmd[cmd.index("-r") + 1])
+            pins = path.read_text().split()
+            seen.extend(pins)
+            deps = [{"name": p.split("==")[0], "version": "1.0", "vulns": []} for p in pins]
+            if "pkg07==1.0" in pins:
+                deps[pins.index("pkg07==1.0")]["vulns"] = [
+                    {"id": "GHSA-x", "aliases": [], "fix_versions": ["1.1"]},
+                ]
+            return MagicMock(returncode=1, stdout=json.dumps({"dependencies": deps}), stderr="")
+
+        with patch("depfresh.audit.run", side_effect=fake_run) as mock_run:
+            vulns = run_audit("/tool/bin/python", req, "test")
+
+        assert mock_run.call_count == 3  # 40 pins in chunks of 15
+        assert sorted(seen) == [f"{n}==1.0" for n in names]
+        assert [(v.package, v.cve) for v in vulns] == [("pkg07", "GHSA-x")]
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["pins.txt"]
+
+    def test_one_failing_chunk_fails_the_audit(self, tmp_path: Path) -> None:
+        req = tmp_path / "pins.txt"
+        req.write_text("".join(f"pkg{i}==1.0\n" for i in range(20)))
+        results = [
+            MagicMock(returncode=0, stdout='{"dependencies": []}', stderr=""),
+            MagicMock(returncode=2, stdout="", stderr="osv unreachable"),
+        ]
+        with patch("depfresh.audit.run", side_effect=results):
+            with pytest.raises(AuditError, match="osv unreachable"):
+                run_audit("/tool/bin/python", req, "test")

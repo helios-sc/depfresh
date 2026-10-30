@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import json
 import logging
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from packaging.version import InvalidVersion, Version
@@ -87,8 +88,18 @@ def write_pinned_requirements(pkgs: dict[str, str], path: Path) -> None:
     path.write_text("\n".join(lines) + "\n" if lines else "")
 
 
+#: Requirements per pip-audit process.  pip-audit queries OSV once per package,
+#: one after another, so a 100-package set takes ~40 s in one process; the
+#: set is split into chunks audited in parallel (still the complete set).
+AUDIT_CHUNK_SIZE = 15
+AUDIT_MAX_JOBS = 8
+
+
 def run_audit(tool_python: str, req_path: Path, label: str) -> list[Vulnerability]:
     """Run pip-audit against a fully pinned requirements file.
+
+    Large files are split into chunks of :data:`AUDIT_CHUNK_SIZE` lines that
+    are audited by parallel pip-audit processes; every line is audited.
 
     Args:
         tool_python: Interpreter of the pip-audit tool environment (see
@@ -104,9 +115,49 @@ def run_audit(tool_python: str, req_path: Path, label: str) -> list[Vulnerabilit
             fails closed: a broken audit never reads as a clean one.
     """
     log.info("Running vulnerability audit (%s)", label)
-    if not req_path.read_text().strip():
+    lines = [line for line in req_path.read_text().splitlines() if line.strip()]
+    if not lines:
         log.info("Audit (%s): nothing to audit", label)
         return []
+
+    chunks = [lines[i:i + AUDIT_CHUNK_SIZE] for i in range(0, len(lines), AUDIT_CHUNK_SIZE)]
+    if len(chunks) == 1:
+        datasets = [_audit_file(tool_python, req_path, label)]
+    else:
+        paths = []
+        for index, chunk in enumerate(chunks):
+            chunk_path = req_path.with_name(f"{req_path.stem}.part{index}{req_path.suffix}")
+            chunk_path.write_text("\n".join(chunk) + "\n")
+            paths.append(chunk_path)
+        try:
+            with ThreadPoolExecutor(max_workers=min(AUDIT_MAX_JOBS, len(paths))) as pool:
+                datasets = list(pool.map(lambda p: _audit_file(tool_python, p, label), paths))
+        finally:
+            for chunk_path in paths:
+                chunk_path.unlink(missing_ok=True)
+
+    dependencies: list[object] = []
+    for data in datasets:
+        if isinstance(data, dict):
+            dependencies.extend(data.get("dependencies", []))
+        elif isinstance(data, list):
+            dependencies.extend(data)
+    vulns = _parse_pip_audit_data({"dependencies": dependencies})
+    log.info("Audit (%s): found %d vulnerabilities", label, len(vulns))
+
+    if vulns:
+        pkg_vulns: dict[str, list[str]] = {}
+        for v in vulns:
+            key = f"{v.package}=={v.version}"
+            pkg_vulns.setdefault(key, []).append(v.cve)
+        for pkg, cves in pkg_vulns.items():
+            log.debug("  %s: %s", pkg, ", ".join(cves))
+
+    return vulns
+
+
+def _audit_file(tool_python: str, req_path: Path, label: str) -> object:
+    """Run one pip-audit process over *req_path* and return its decoded JSON."""
     result = run(audit_command(tool_python, req_path), check=False)
 
     if result.returncode not in (0, 1):
@@ -122,25 +173,12 @@ def run_audit(tool_python: str, req_path: Path, label: str) -> list[Vulnerabilit
         )
 
     try:
-        data = json.loads(result.stdout)
+        return json.loads(result.stdout)
     except json.JSONDecodeError as exc:
         detail = result.stderr.strip() or result.stdout.strip()
         raise AuditError(
             f"pip-audit produced invalid JSON during {label}: {detail[-800:]}"
         ) from exc
-
-    vulns = _parse_pip_audit_data(data)
-    log.info("Audit (%s): found %d vulnerabilities", label, len(vulns))
-
-    if vulns:
-        pkg_vulns: dict[str, list[str]] = {}
-        for v in vulns:
-            key = f"{v.package}=={v.version}"
-            pkg_vulns.setdefault(key, []).append(v.cve)
-        for pkg, cves in pkg_vulns.items():
-            log.debug("  %s: %s", pkg, ", ".join(cves))
-
-    return vulns
 
 
 def _parse_pip_audit_json(output: str) -> list[Vulnerability]:
