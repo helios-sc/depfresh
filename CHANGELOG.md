@@ -9,6 +9,8 @@ Versioning follows [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [0.2.0] — 2026-10-30
+
 The default remediation now audits and fixes what actually ships, and moves only vulnerable packages. 0.1.0 audited a fresh resolution instead of the lock, so it could report a uv-locked project clean while its lock shipped known advisories; it also rewrote requirements files as a freeze of the machine it ran on and could downgrade packages. This release addresses those issues.
 
 ### Added
@@ -76,5 +78,6 @@ Initial public release.
 - Custom exception hierarchy (`DepfreshError` and subclasses) for clean error handling
 - Exit codes: `0` = clean, `1` = error, `2` = vulnerabilities remain
 
-[Unreleased]: https://github.com/helios-sc/depfresh/compare/v0.1.0...HEAD
+[Unreleased]: https://github.com/helios-sc/depfresh/compare/v0.2.0...HEAD
+[0.2.0]: https://github.com/helios-sc/depfresh/compare/v0.1.0...v0.2.0
 [0.1.0]: https://github.com/helios-sc/depfresh/releases/tag/v0.1.0
