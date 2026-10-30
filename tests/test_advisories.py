@@ -394,6 +394,42 @@ class TestOpenAdvisoryRows:
         assert reasons[1] == "No fixed release available yet"
 
 
+class TestRecordPlans:
+    """One report row per package, across rounds and the repository step."""
+
+    def test_a_second_move_keeps_the_original_version(self) -> None:
+        from depfresh.advisories import FixPlan
+        from depfresh.remediation import record_plans
+
+        first = FixPlan("demo", "2.0.0", [_vuln("demo", "2.0.0", "GHSA-aaaa")], status="fix",
+                        target="2.0.1", kind="patch")
+        second = FixPlan("demo", "2.0.1", [_vuln("demo", "2.0.1", "GHSA-bbbb")], status="fix",
+                         target="2.1.0", kind="minor")
+        plans: dict[str, Any] = {}
+        record_plans(plans, {"demo": first})
+        record_plans(plans, {"demo": second})
+        row = plans["demo"]
+        assert (row.current, row.target, row.kind) == ("2.0.0", "2.1.0", "minor")
+        assert [v.cve for v in row.vulns] == ["GHSA-aaaa", "GHSA-bbbb"]
+
+    def test_a_later_plan_without_a_fix_explains_its_advisories(self) -> None:
+        from depfresh.advisories import FixPlan
+        from depfresh.remediation import planned_fixes, record_plans, remaining_reasons
+
+        first = FixPlan("demo", "2.0.0", [_vuln("demo", "2.0.0", "GHSA-aaaa")], status="fix",
+                        target="2.0.1")
+        later = FixPlan("demo", "2.0.1", [_vuln("demo", "2.0.1", "GHSA-new")], status="no-fix",
+                        reason="No fixed release available yet",
+                        open_advisories={"GHSA-new": "No fixed release available yet"})
+        plans: dict[str, Any] = {}
+        record_plans(plans, {"demo": first})
+        record_plans(plans, {"demo": later})
+        left = [_vuln("demo", "2.0.1", "GHSA-new")]
+        rows = planned_fixes(plans, {"demo": "2.0.1"}, {}, left, applied=True)
+        assert rows[0].status == "applied"
+        assert remaining_reasons(left, rows) == ["No fixed release available yet"]
+
+
 class TestTargetEnv:
     def test_linux_markers(self) -> None:
         env = TargetEnv("3.11")

@@ -56,3 +56,48 @@ class MixedSources:
 
     def releases(self, package: str) -> list[Release]:
         return [Release(Version(v)) for v in ("2.0.0", "2.0.1", "2.1.0", "3.0.0")]
+
+
+class TwoSourceAuditor:
+    """Database findings by version, plus repository findings (``--repo-advisories``).
+
+    *repo* maps a package to ``(affected specifier, patched version)``.
+    """
+
+    def __init__(self, db: dict[str, set[str]], repo: dict[str, tuple[str, str]]) -> None:
+        self.db = db
+        self.repo = repo
+
+    def audit(self, pins: dict[str, str], label: str) -> list[Vulnerability]:
+        from packaging.specifiers import SpecifierSet
+
+        found = [Vulnerability(n, v, f"GHSA-{n}", "", "") for n, v in sorted(pins.items())
+                 if v in self.db.get(n, set())]
+        for name, (spec, fix) in sorted(self.repo.items()):
+            if name in pins and Version(pins[name]) in SpecifierSet(spec):
+                found.append(Vulnerability(
+                    name, pins[name], f"GHSA-repo-{name}", fix, "[repository advisory]",
+                    source="repository", affected=(spec,),
+                ))
+        return found
+
+
+class TwoSourceSources:
+    """OSV knows the database advisories (*fixes*, ``None``: no fix); PyPI has *releases*."""
+
+    def __init__(self, fixes: dict[str, str | None], releases: dict[str, list[str]]) -> None:
+        self.fixes = fixes
+        self._releases = releases
+
+    def osv_records(self, package: str, version: str) -> list[dict[str, Any]]:
+        if package not in self.fixes:
+            return []
+        fix = self.fixes[package]
+        events = [{"introduced": "0"}, *([{"fixed": fix}] if fix else [])]
+        return [{"id": f"GHSA-{package}", "affected": [{
+            "package": {"name": package, "ecosystem": "PyPI"},
+            "ranges": [{"type": "ECOSYSTEM", "events": events}],
+        }]}]
+
+    def releases(self, package: str) -> list[Release]:
+        return [Release(Version(v)) for v in self._releases[package]]

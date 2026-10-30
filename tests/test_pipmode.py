@@ -33,7 +33,7 @@ from depfresh.pipmode import (
 )
 from depfresh.remediation import RemediationOptions
 from depfresh.reqlines import parse_lines
-from tests.helpers import MixedAuditor, MixedSources
+from tests.helpers import MixedAuditor, MixedSources, TwoSourceAuditor, TwoSourceSources
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -409,6 +409,36 @@ class TestNonPyPIIndexes:
         assert outcome.not_audited == [
             f"private-widget==0.1.0 (private index {self.PRIVATE}; not audited)",
         ]
+
+
+class TestRepositoryAdvisories:
+    UNIVERSE = {"aiohttp": ["3.14.1", "3.14.4"], "yarl": ["1.24.2", "1.25.1"],
+                "six": ["1.17.0", "1.17.1"]}
+    TEXT = "aiohttp==3.14.1\nyarl==1.24.2\nsix>=1.17\n"
+
+    def test_repository_advisories_are_fixed_after_the_database(self, tmp_path: Path) -> None:
+        resolver = FakeResolver(self.UNIVERSE, {})
+        outcome = _remediate(
+            tmp_path, self.TEXT, resolver, {}, {},
+            auditor=TwoSourceAuditor({"aiohttp": {"3.14.1"}}, {"yarl": ("<1.25.1", "1.25.1")}),
+            sources=TwoSourceSources({"aiohttp": "3.14.4"}, self.UNIVERSE),
+        )
+        assert outcome.new_text == "aiohttp==3.14.4\nyarl==1.25.1\nsix>=1.17\n"
+        assert outcome.post_vulns == []
+
+    def test_repository_fixes_never_leave_more_database_findings(
+        self, tmp_path: Path,
+    ) -> None:
+        resolver = FakeResolver(self.UNIVERSE, {("yarl", "1.25.1"): {"six": ">=1.17.1"}})
+        outcome = _remediate(
+            tmp_path, self.TEXT.replace("six>=1.17", "six==1.17.0"), resolver, {}, {},
+            auditor=TwoSourceAuditor({"aiohttp": {"3.14.1"}, "six": {"1.17.1"}},
+                                     {"yarl": ("<1.25.1", "1.25.1")}),
+            sources=TwoSourceSources({"aiohttp": "3.14.4", "six": None}, self.UNIVERSE),
+        )
+        assert outcome.new_text == "aiohttp==3.14.4\nyarl==1.24.2\nsix==1.17.0\n"
+        assert [(v.package, v.from_repository) for v in outcome.post_vulns] == [("yarl", True)]
+        assert outcome.failures["yarl"].startswith("Not applied: fixing the repository")
 
 
 class TestRemediatePip:

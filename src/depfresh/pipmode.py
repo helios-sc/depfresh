@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import re
 import sys
-from collections.abc import Iterable
+from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -54,8 +54,12 @@ from depfresh.remediation import (
     ImportGate,
     RemediationOptions,
     cobump_problem,
+    database_findings,
     diff_sets,
+    keep_repository_findings_open,
     plan,
+    record_plans,
+    snapshot_plans,
 )
 from depfresh.reqlines import (
     COMMENT_RE,
@@ -810,34 +814,66 @@ def remediate_pip(
     additions: dict[str, tuple[str, str]] = {}  # unlisted package -> (specifier, comment)
     current, current_vulns = baseline, pre_vulns
     attempted: dict[str, str] = {}
-    for round_no in range(1, options.max_rounds + 1):
-        new_plans = plan(current_vulns, current.pins, options, sources, private)
-        for name, p in new_plans.items():
-            if name not in plans or p.status == "fix":
-                plans[name] = p
-        targets = {n: p.target for n, p in new_plans.items()
-                   if p.status == "fix" and p.target and attempted.get(n) != p.target}
-        if not targets:
-            break
-        log.info("Round %d: fixing %s", round_no,
-                 ", ".join(f"{n}>={v}" for n, v in sorted(targets.items())))
-        attempted.update(targets)
-        _plan_edits(ws, doc, fmt, original, baseline, current, targets, new_plans, edits,
-                    additions, failures, options, notes)
-        text = _render(fmt, original, options, edits, additions, ws)
-        try:
-            current = ws.compile(ws.write(text))
-            if hashed and _pin_new_dependencies(
-                fmt, text, options, baseline, current, additions,
-            ):
-                text = _render(fmt, original, options, edits, additions, ws)
+
+    def rounds(considered: Callable[[list[Vulnerability]], list[Vulnerability]]) -> None:
+        nonlocal current, current_vulns
+        for round_no in range(1, options.max_rounds + 1):
+            new_plans = plan(considered(current_vulns), current.pins, options, sources, private)
+            record_plans(plans, new_plans)
+            targets = {n: p.target for n, p in new_plans.items()
+                       if p.status == "fix" and p.target and attempted.get(n) != p.target}
+            if not targets:
+                return
+            log.info("Round %d: fixing %s", round_no,
+                     ", ".join(f"{n}>={v}" for n, v in sorted(targets.items())))
+            attempted.update(targets)
+            _plan_edits(ws, doc, fmt, original, baseline, current, targets, new_plans, edits,
+                        additions, failures, options, notes)
+            text = _render(fmt, original, options, edits, additions, ws)
+            try:
                 current = ws.compile(ws.write(text))
-        except CommandError as exc:
-            notes.append(f"Edited manifest does not resolve: {_first_line(exc.stderr)}")
-            break
-        current_vulns = auditor.audit(current.public_pins(ws.scope), f"post-upgrade-{round_no}")
-        if not current_vulns:
-            break
+                if hashed and _pin_new_dependencies(
+                    fmt, text, options, baseline, current, additions,
+                ):
+                    text = _render(fmt, original, options, edits, additions, ws)
+                    current = ws.compile(ws.write(text))
+            except CommandError as exc:
+                notes.append(f"Edited manifest does not resolve: {_first_line(exc.stderr)}")
+                return
+            current_vulns = auditor.audit(current.public_pins(ws.scope),
+                                          f"post-upgrade-{round_no}")
+            if not considered(current_vulns):
+                return
+
+    # The advisory database first, exactly as a run without --repo-advisories;
+    # then the repository advisories, kept only if they leave no more database
+    # findings than that.
+    rounds(database_findings)
+    if any(v.from_repository for v in current_vulns):
+        before = len(database_findings(current_vulns))
+        saved = (dict(edits), dict(additions), current, current_vulns, snapshot_plans(plans),
+                 dict(failures), list(notes))
+        rounds(list)
+        after = len(database_findings(current_vulns))
+        if after > before:
+            tried = dict(plans)
+            kept_edits, kept_additions, current, current_vulns, kept_plans, kept_failures, \
+                kept_notes = saved
+            edits.clear()
+            edits.update(kept_edits)
+            additions.clear()
+            additions.update(kept_additions)
+            plans.clear()
+            plans.update(kept_plans)
+            failures.clear()
+            failures.update(kept_failures)
+            notes[:] = kept_notes
+            reason = (f"Not applied: fixing the repository advisories left {after} database "
+                      f"advisories instead of {before}")
+            keep_repository_findings_open(plans, tried, failures, current_vulns, reason)
+            notes.append(f"Repository advisories were not fixed: their fixes left {after} "
+                         f"database advisories instead of {before}")
+            log.warning("%s", notes[-1])
 
     new_text = _render(fmt, original, options, edits, additions, ws)
     changed = new_text != original

@@ -30,7 +30,7 @@ from depfresh.lockmode import (
 from depfresh.models import ImportCheck, UpgradeResult, Vulnerability
 from depfresh.remediation import RemediationOptions
 from depfresh.upgrade import upgrade
-from tests.helpers import MixedAuditor, MixedSources
+from tests.helpers import MixedAuditor, MixedSources, TwoSourceAuditor, TwoSourceSources
 
 _upgrade_mod = sys.modules["depfresh.upgrade"]
 
@@ -557,6 +557,41 @@ class TestRemediateLock:
         assert outcome.failures["aiohttp"] == (
             "aiohttp==3.14.4 moves yarl 1.24.2→1.25.1, which --keep-version keeps"
         )
+
+    REPO_RELEASES = {**RELEASES, "yarl": ["1.24.2", "1.25.1"], "six": ["1.17.0", "1.17.1"]}
+
+    def test_repository_advisories_are_fixed_after_the_database(self, tmp_path: Path) -> None:
+        auditor = TwoSourceAuditor({"aiohttp": {"3.14.1"}}, {"yarl": ("<1.25.1", "1.25.1")})
+        sources = TwoSourceSources({"aiohttp": "3.14.4"}, self.REPO_RELEASES)
+        outcome, project = _run(
+            tmp_path, lambda root: FakeProject(root, self.BASE, {}, PYPROJECT), auditor, sources,
+        )
+        # the database fix first, exactly as without the flag; then the repository fix
+        assert project.lock_calls == [{"aiohttp": "3.14.4"}, {"yarl": "1.25.1"}]
+        assert outcome.final.pins == {**self.BASE, "aiohttp": "3.14.4", "yarl": "1.25.1"}
+        assert outcome.post_vulns == []
+
+    def test_repository_fixes_never_leave_more_database_findings(
+        self, tmp_path: Path,
+    ) -> None:
+        """yarl's repository fix drags six onto a release with an unfixed database advisory."""
+        auditor = TwoSourceAuditor({"aiohttp": {"3.14.1"}, "six": {"1.17.1"}},
+                                   {"yarl": ("<1.25.1", "1.25.1")})
+        sources = TwoSourceSources({"aiohttp": "3.14.4", "six": None}, self.REPO_RELEASES)
+        outcome, project = _run(
+            tmp_path,
+            lambda root: FakeProject(root, self.BASE, {"yarl==1.25.1": {"six": "1.17.1"}},
+                                     PYPROJECT),
+            auditor, sources,
+        )
+        assert outcome.final.pins == {**self.BASE, "aiohttp": "3.14.4"}
+        assert read_lock(project.lock_path)[1] == read_lock_from({**self.BASE,
+                                                                  "aiohttp": "3.14.4"})
+        assert [(v.package, v.from_repository) for v in outcome.post_vulns] == [("yarl", True)]
+        assert outcome.failures["yarl"].startswith("Not applied: fixing the repository "
+                                                   "advisories left 1 database advisories "
+                                                   "instead of 0")
+        assert any("Repository advisories were not fixed" in n for n in outcome.notes)
 
     def test_follow_up_round_for_a_vulnerable_co_upgrade(self, tmp_path: Path) -> None:
         auditor = FakeAuditor({"aiohttp": {"3.14.1"}, "yarl": {"1.24.9"}})

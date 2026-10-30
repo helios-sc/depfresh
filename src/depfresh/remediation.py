@@ -11,6 +11,7 @@ platform and line edits), which lives in :mod:`depfresh.lockmode` and
 
 from __future__ import annotations
 
+import dataclasses
 import logging
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
@@ -99,16 +100,24 @@ class Auditor:
         """What the repository-advisory pass covered, for reports."""
         if self.repo_check is None:
             return []
+        check = self.repo_check
         note = (
-            f"Repository advisories: checked {len(self.repo_check.repos_checked)} GitHub "
+            f"Repository advisories: checked {len(check.repos_checked)} GitHub "
             "repositories of shipped packages"
         )
-        if self.repo_check.unmapped:
+        if check.in_database:
+            note += (f"; {len(check.in_database)} of their advisories are in the global "
+                     "database already, so OSV's ranges apply to them")
+        if check.unmapped:
             note += (
-                f"; {len(self.repo_check.unmapped)} packages declare no GitHub repository "
+                f"; {len(check.unmapped)} packages declare no GitHub repository "
                 "and were not checked"
             )
-        return [note]
+        notes = [note]
+        for ghsa, what in sorted(check.unreadable.items()):
+            notes.append(f"Check by hand: repository advisory {ghsa} ({what}) has a version "
+                         "range depfresh cannot read")
+        return notes
 
 
 @dataclass
@@ -198,6 +207,65 @@ def disallowed_majors(
         if classify_bump(c.old_version, c.new_version) == "major"
         and not major_allowed(c.name, allow_major)
     ]
+
+
+def database_findings(vulns: Iterable[Vulnerability]) -> list[Vulnerability]:
+    """The findings of the advisory database (everything but repository advisories)."""
+    return [v for v in vulns if not v.from_repository]
+
+
+def record_plans(plans: dict[str, FixPlan], new_plans: Mapping[str, FixPlan]) -> None:
+    """Merge one round's plans into the run's (one plan per package, for the report).
+
+    A later fix plan of a package that already moved keeps the original
+    version and advisories, so the row reads "from → final".  A later plan
+    without a fix only adds the reasons of the advisories it leaves open.
+    """
+    for name, new in new_plans.items():
+        old = plans.get(name)
+        if old is None:
+            plans[name] = new
+        elif new.status == "fix":
+            if old.status == "fix" and old.current != new.current:
+                seen = {i for v in new.vulns for i in v.ids}
+                new = dataclasses.replace(
+                    new,
+                    current=old.current,
+                    vulns=[*(v for v in old.vulns if not seen & set(v.ids)), *new.vulns],
+                    kind=classify_bump(old.current, new.target or ""),
+                    open_advisories={**{k: w for k, w in old.open_advisories.items()
+                                        if k not in seen}, **new.open_advisories},
+                )
+            plans[name] = new
+        else:
+            for vid, why in new.open_advisories.items():
+                old.open_advisories.setdefault(vid, why)
+
+
+def snapshot_plans(plans: Mapping[str, FixPlan]) -> dict[str, FixPlan]:
+    """A copy of *plans* that later merges cannot change."""
+    return {n: dataclasses.replace(p, open_advisories=dict(p.open_advisories))
+            for n, p in plans.items()}
+
+
+def keep_repository_findings_open(
+    plans: dict[str, FixPlan],
+    tried: Mapping[str, FixPlan],
+    failures: dict[str, str],
+    remaining: Iterable[Vulnerability],
+    reason: str,
+) -> None:
+    """After reverting the repository step: say why each repository finding stays."""
+    for v in remaining:
+        if not v.from_repository:
+            continue
+        name = normalise(v.package)
+        if name in plans:
+            for vid in v.ids:
+                plans[name].open_advisories[vid] = reason
+        elif name in tried:
+            plans[name] = tried[name]
+            failures[name] = reason
 
 
 def cobump_problem(

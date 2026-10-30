@@ -181,7 +181,11 @@ Advisories are counted once: OSV's GHSA and PYSEC records of the same issue are 
 
 ### Repository advisories (opt-in)
 
-Maintainers can publish an advisory in their own GitHub repository days before it reaches the GitHub Advisory Database, OSV and pip-audit. `--repo-advisories` maps every shipped package to its repository (from its PyPI project URLs), reads the published advisories with `gh api`, and treats the ones that affect the shipped version like any other finding.
+Maintainers can publish an advisory in their own GitHub repository days before it reaches the GitHub Advisory Database, OSV and pip-audit. `--repo-advisories` maps every shipped package to its repository (from its PyPI project URLs) and reads the published advisories with `gh api`. It needs an authenticated `gh`; any API failure fails the run.
+
+- Only advisories the global database does not have yet are added: `gh api advisories/<ghsa>` answers 404. An advisory the database has is left to OSV, whose curated ranges already decided whether it affects the shipped version.
+- Ranges are read as written: a bare version (`0.6.1`) is that version only, a list of bare versions (`1.6.5, 1.6.6`) each of them, comparators (`>= 2.0, < 2.14.2`) all together, and a range without an upper bound (`>= 37.0.0`) ends at the patched version. A range that cannot be read is listed for checking by hand; it never counts as affecting every version.
+- Database findings are fixed first, exactly as without the flag. The repository findings are fixed afterwards, and that second step is kept only if it leaves no more database findings than the first; otherwise it is undone and the report says why.
 
 ## Supported formats
 

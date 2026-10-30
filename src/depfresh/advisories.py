@@ -523,14 +523,17 @@ def _plan_versions(
         records = []
         plan.approximate = True
     advisory_records = _records_by_advisory(plan.vulns, records)
-    if any(not recs for recs in advisory_records):
+    if any(not recs and not v.affected for recs, v in zip(advisory_records, plan.vulns)):
         plan.approximate = plan.approximate or bool(records)
 
     def affected(index: int, version: Version) -> bool:
         recs = advisory_records[index]
         if recs:
             return any(record_affects(r, plan.package, version) for r in recs)
-        return _affected_by_fix_versions(plan.vulns[index], current, version)
+        vuln = plan.vulns[index]
+        if vuln.affected:
+            return _in_any(vuln.affected, version)
+        return _affected_by_fix_versions(vuln, current, version)
 
     try:
         releases = [r for r in sources.releases(plan.package) if not r.yanked]
@@ -633,6 +636,17 @@ def _records_by_advisory(
         ]
         result.append(matched)
     return result
+
+
+def _in_any(specifier_sets: Iterable[str], version: Version) -> bool:
+    """True when *version* matches any of *specifier_sets* (unreadable sets never match)."""
+    for spec in specifier_sets:
+        try:
+            if SpecifierSet(spec).contains(version, prereleases=True):
+                return True
+        except InvalidSpecifier:
+            continue
+    return False
 
 
 def _affected_by_fix_versions(vuln: Vulnerability, current: Version, version: Version) -> bool:

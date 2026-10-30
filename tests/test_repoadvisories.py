@@ -17,9 +17,11 @@ from depfresh.repoadvisories import (
     RepoAdvisoryChecker,
     RepoAdvisoryError,
     _concatenated_arrays,
+    affects,
     gh_advisories,
+    gh_in_database,
     github_repo,
-    range_contains,
+    parse_range,
 )
 
 PYASN1_REPO_ADVISORY: dict[str, Any] = {
@@ -72,17 +74,36 @@ class TestHelpers:
         assert github_repo(urls) == repo
 
     @pytest.mark.parametrize(
-        ("rng", "version", "expected"),
+        ("rng", "patched", "version", "expected"),
         [
-            ("<= 0.6.4", "0.6.4", True),
-            ("<= 0.6.4", "0.6.5", False),
-            (">= 0.3.3, < 0.6.5", "0.6.3", True),
-            ("= 3.3.1", "3.3.1", True),
-            ("= 3.3.1", "4.0.0", False),
+            ("<= 0.6.4", "0.6.5", "0.6.4", True),
+            ("<= 0.6.4", "0.6.5", "0.6.5", False),
+            (">= 0.3.3, < 0.6.5", "", "0.6.3", True),
+            (">= 2.0, < 2.14.2", "2.14.2", "2.13.4", True),
+            (">= 2.0, < 2.14.2", "2.14.2", "2.14.2", False),
+            ("= 3.3.1", "", "3.3.1", True),
+            ("= 3.3.1", "", "4.0.0", False),
+            # a bare version is that version exactly; a list of them, each one
+            ("0.6.1", "", "0.6.1", True),
+            ("0.6.1", "", "0.6.4", False),
+            ("1.6.5, 1.6.6", "1.6.7", "1.6.6", True),
+            ("1.6.5, 1.6.6", "1.6.7", "1.7.2", False),
+            # an open range ends at the patched version
+            (">= 37.0.0", ">= 38.0.3", "37.0.4", True),
+            (">= 37.0.0", ">= 38.0.3", "46.0.6", False),
+            (">= 37.0.0", "", "46.0.6", True),
         ],
     )
-    def test_range_contains(self, rng: str, version: str, expected: bool) -> None:
-        assert range_contains(rng, version) is expected
+    def test_ranges_are_read_as_written(
+        self, rng: str, patched: str, version: str, expected: bool,
+    ) -> None:
+        specs = parse_range(rng, patched)
+        assert specs is not None
+        assert affects(specs, version) is expected
+
+    @pytest.mark.parametrize("rng", ["", "  ", "1.6.5, >= 2.0", ">= abc", "~> 1.2", "1.x"])
+    def test_unreadable_ranges(self, rng: str) -> None:
+        assert parse_range(rng, "1.0") is None
 
     def test_paginated_output(self) -> None:
         text = '[{"ghsa_id": "A"}]\n[{"ghsa_id": "B", "summary": "x][y"}]\n'
@@ -129,6 +150,28 @@ class TestGhAdvisories:
                 gh_advisories("pyasn1", "pyasn1")
 
 
+class TestGhInDatabase:
+    def _run(self, returncode: int, stderr: str = "") -> bool:
+        result = MagicMock(returncode=returncode, stdout="{}", stderr=stderr)
+        with (
+            patch("depfresh.repoadvisories.shutil.which", return_value="/usr/bin/gh"),
+            patch("depfresh.repoadvisories.subprocess.run", return_value=result) as mock,
+        ):
+            found = gh_in_database("GHSA-2xm2-c8xx-p9vh")
+        assert mock.call_args.args[0][-1] == "advisories/GHSA-2xm2-c8xx-p9vh"
+        return found
+
+    def test_in_the_database(self) -> None:
+        assert self._run(0) is True
+
+    def test_repository_only(self) -> None:
+        assert self._run(1, "gh: Not Found (HTTP 404)") is False
+
+    def test_other_errors_fail_the_run(self) -> None:
+        with pytest.raises(RepoAdvisoryError, match="rate limit"):
+            self._run(1, "HTTP 403: API rate limit exceeded")
+
+
 class TestChecker:
     URLS = {
         "pyasn1": ["https://github.com/pyasn1/pyasn1"],
@@ -138,15 +181,18 @@ class TestChecker:
         "internal-tool": [],
     }
 
-    def _checker(self, calls: list[tuple[str, str]]) -> RepoAdvisoryChecker:
+    def _checker(self, calls: list[tuple[str, str]], in_database: set[str] | None = None,
+                 extra: list[dict[str, Any]] | None = None) -> RepoAdvisoryChecker:
         def fetch(owner: str, repo: str) -> list[dict[str, Any]]:
             calls.append((owner, repo))
             return {
-                ("pyasn1", "pyasn1"): [PYASN1_REPO_ADVISORY],
+                ("pyasn1", "pyasn1"): [PYASN1_REPO_ADVISORY, *(extra or [])],
                 ("grpc", "grpc"): [GRPC_REPO_ADVISORY],
             }.get((owner, repo), [])
 
-        return RepoAdvisoryChecker(urls=FakeUrls(self.URLS), fetch=fetch)
+        database = in_database or set()
+        return RepoAdvisoryChecker(urls=FakeUrls(self.URLS), fetch=fetch,
+                                   known_to_database=lambda ghsa: ghsa in database)
 
     def test_finds_advisories_missing_from_the_db(self) -> None:
         calls: list[tuple[str, str]] = []
@@ -175,6 +221,37 @@ class TestChecker:
         checker.findings({"pyasn1": "0.6.4"}, known=[])
         checker.findings({"pyasn1": "0.6.5"}, known=[])
         assert calls == [("pyasn1", "pyasn1")]
+
+    def test_advisories_in_the_global_database_are_left_to_osv(self) -> None:
+        """A loose repository range must not re-add what OSV already judged."""
+        loose = {
+            "ghsa_id": "GHSA-63vm-454h-vhhq", "cve_id": "CVE-2026-23490", "severity": "high",
+            "summary": "already in the database",
+            "vulnerabilities": [{"package": {"ecosystem": "pip", "name": "pyasn1"},
+                                 "vulnerable_version_range": ">= 0.1.0",
+                                 "patched_versions": ""}],
+        }
+        checker = self._checker([], in_database={"GHSA-63vm-454h-vhhq"}, extra=[loose])
+        found = checker.findings({"pyasn1": "0.6.4"}, known=[])
+        assert [v.ghsa for v in found] == ["GHSA-mm57-4v3p-rchx"]
+        assert found[0].from_repository and found[0].affected == ("<=0.6.4",)
+        assert checker.in_database == {"GHSA-63vm-454h-vhhq"}
+
+    def test_unreadable_ranges_are_reported_not_added(self) -> None:
+        odd = {
+            "ghsa_id": "GHSA-odd0-odd0-odd0", "cve_id": None, "severity": "low",
+            "summary": "odd range",
+            "vulnerabilities": [{"package": {"ecosystem": "pip", "name": "pyasn1"},
+                                 "vulnerable_version_range": "0.6.x",
+                                 "patched_versions": ""}],
+        }
+        checker = self._checker([], extra=[odd])
+        found = checker.findings({"pyasn1": "0.6.4"}, known=[])
+        assert [v.ghsa for v in found] == ["GHSA-mm57-4v3p-rchx"]
+        assert checker.unreadable == {"GHSA-odd0-odd0-odd0": "pyasn1: '0.6.x'"}
+        auditor = Auditor("/tool/bin/python", Path("."), repo_check=checker)
+        assert any("Check by hand: repository advisory GHSA-odd0-odd0-odd0" in n
+                   for n in auditor.notes())
 
     def test_planner_targets_the_patched_version(self) -> None:
         """No OSV record exists yet: the plan falls back to the patched version."""

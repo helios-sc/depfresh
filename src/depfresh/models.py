@@ -63,6 +63,17 @@ class Vulnerability:
     fix_versions: str
     description: str
     aliases: tuple[str, ...] = ()
+    #: ``""`` for the advisory database (pip-audit, OSV); ``"repository"``
+    #: for a GitHub repository advisory that is not in the database yet.
+    source: str = ""
+    #: For advisories OSV does not know: the affected versions as PEP 440
+    #: specifier sets, any one of which matches (``(">=2.0,<2.14.2",)``).
+    affected: tuple[str, ...] = ()
+
+    @property
+    def from_repository(self) -> bool:
+        """True for a repository advisory (``--repo-advisories``)."""
+        return self.source == "repository"
 
     @property
     def ids(self) -> tuple[str, ...]:
