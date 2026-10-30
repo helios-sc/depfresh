@@ -246,9 +246,21 @@ class TestAuditCommand:
     def test_audits_exact_pins_without_resolving(self, tmp_path: Path) -> None:
         """--no-deps --disable-pip: pip-audit must not build its own resolver venv."""
         cmd = audit_command("/tool/bin/python", tmp_path / "pins.txt")
-        assert cmd[:3] == ["/tool/bin/python", "-m", "pip_audit"]
+        assert cmd[:4] == ["/tool/bin/python", "-I", "-m", "pip_audit"]
         assert "--no-deps" in cmd
         assert "--disable-pip" in cmd
+
+    def test_runs_isolated_from_an_empty_directory(self, tmp_path: Path) -> None:
+        """Neither the caller's directory nor PYTHON* variables reach pip-audit's sys.path."""
+        from depfresh.audit import _audit_file
+
+        result = MagicMock(returncode=0, stdout='{"dependencies": []}', stderr="")
+        with patch("depfresh.audit.run", return_value=result) as mock_run:
+            _audit_file("/tool/bin/python", tmp_path / "pins.txt", "test")
+        cmd, kwargs = mock_run.call_args.args[0], mock_run.call_args.kwargs
+        assert cmd[1] == "-I"
+        cwd = Path(kwargs["cwd"])
+        assert cwd != Path.cwd() and not cwd.exists()  # a temporary, now removed, directory
 
     def test_uses_osv_service(self, tmp_path: Path) -> None:
         cmd = audit_command("/tool/bin/python", tmp_path / "pins.txt")
@@ -398,7 +410,7 @@ class TestChunkedAudit:
         req.write_text("".join(f"{n}==1.0\n" for n in names))
         seen: list[str] = []
 
-        def fake_run(cmd: list[str], check: bool = True) -> MagicMock:
+        def fake_run(cmd: list[str], check: bool = True, cwd: str | None = None) -> MagicMock:
             path = Path(cmd[cmd.index("-r") + 1])
             pins = path.read_text().split()
             seen.extend(pins)

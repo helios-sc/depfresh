@@ -7,6 +7,13 @@ top-level name with :func:`importlib.util.find_spec`, each submodule with a
 third-party module code runs either, and one missing module cannot abort the
 check for the others.
 
+The venv's interpreter runs as ``python -I -S`` from an empty temporary
+directory: ``-I`` keeps the working directory, ``PYTHON*`` variables and the
+user site out of ``sys.path``, and ``-S`` skips :mod:`site`, so no ``.pth``
+hook of an installed package runs.  The check adds the venv's site-packages
+itself and reads each ``.pth`` file as text, taking its path entries and
+ignoring its ``import`` lines.  Only the standard library executes.
+
 Because a project usually has some imports that never resolve (test-only
 tools, optional extras, modules put on ``sys.path`` at runtime), the result is
 only meaningful relative to a baseline: :func:`import_regressions` reports the
@@ -19,6 +26,7 @@ import ast
 import json
 import logging
 import subprocess
+import tempfile
 import textwrap
 import warnings
 from pathlib import Path
@@ -187,12 +195,39 @@ def import_regressions(baseline: ImportCheck, after: ImportCheck) -> dict[str, s
     }
 
 
+def _run_isolated(
+    venv_python: str, script: str, *args: str, timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """``python -I -S -c script`` from an empty directory: only the stdlib runs."""
+    with tempfile.TemporaryDirectory(prefix="depfresh-check-") as empty:
+        return subprocess.run(
+            [venv_python, "-I", "-S", "-c", script, *args],
+            capture_output=True, text=True, timeout=timeout, cwd=empty,
+        )
+
+
+def site_dirs(venv_python: str) -> list[str]:
+    """The site-packages directories of the venv *venv_python* belongs to.
+
+    Found from the venv layout, not by asking the interpreter: with ``-S``
+    it does not know about its venv, and without it every ``.pth`` hook runs.
+    """
+    venv = Path(venv_python).parent.parent
+    found: list[str] = []
+    for pattern in ("lib/python*/site-packages", "lib64/python*/site-packages",
+                    "Lib/site-packages"):
+        for path in sorted(venv.glob(pattern)):
+            resolved = str(path.resolve())
+            if path.is_dir() and resolved not in found:
+                found.append(resolved)
+    return found
+
+
 def _get_stdlib_modules(venv_python: str) -> set[str]:
     """Get stdlib module names from the venv Python."""
-    result = subprocess.run(
-        [venv_python, "-c",
-         "import sys, json; print(json.dumps(sorted(sys.stdlib_module_names)))"],
-        capture_output=True, text=True, timeout=30,
+    result = _run_isolated(
+        venv_python, "import sys, json; print(json.dumps(sorted(sys.stdlib_module_names)))",
+        timeout=30,
     )
     if result.returncode == 0 and result.stdout.strip():
         return set(json.loads(result.stdout.strip()))
@@ -227,6 +262,34 @@ def _batch_import_check(
         import json
         import os
         import sys
+
+        def add_site_dir(sitedir):
+            # site.addsitedir() without running anything: .pth path entries
+            # are added, "import" lines are skipped.
+            if sitedir not in sys.path:
+                sys.path.append(sitedir)
+            try:
+                names = sorted(os.listdir(sitedir))
+            except OSError:
+                return
+            for name in names:
+                if not name.endswith(".pth") or name.startswith("."):
+                    continue
+                try:
+                    with open(os.path.join(sitedir, name), encoding="utf-8") as handle:
+                        lines = handle.read().splitlines()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                for line in lines:
+                    line = line.rstrip()
+                    if not line or line.startswith(("#", "import ", "import\t")):
+                        continue
+                    path = os.path.abspath(os.path.join(sitedir, line))
+                    if os.path.exists(path) and path not in sys.path:
+                        sys.path.append(path)
+
+        for sitedir in json.loads(sys.argv[2]):
+            add_site_dir(sitedir)
 
         LOADERS = [
             (machinery.ExtensionFileLoader, machinery.EXTENSION_SUFFIXES),
@@ -278,9 +341,9 @@ def _batch_import_check(
         print(json.dumps({"results": results, "warnings": {}}))
     """)
 
-    result = subprocess.run(
-        [venv_python, "-I", "-c", check_script, json.dumps(sorted(modules))],
-        capture_output=True, text=True, timeout=120,
+    result = _run_isolated(
+        venv_python, check_script, json.dumps(sorted(modules)),
+        json.dumps(site_dirs(venv_python)), timeout=120,
     )
 
     if result.returncode == 0 and result.stdout.strip():

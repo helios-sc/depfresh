@@ -14,7 +14,9 @@ from depfresh.verify import (
     _batch_import_check,
     _extract_imports,
     _find_local_modules,
+    _get_stdlib_modules,
     import_regressions,
+    site_dirs,
     verify_imports,
 )
 
@@ -172,6 +174,51 @@ class TestVerifyImports:
         assert result.verified == []
         assert result.failed == {}
         assert "helpers" in result.skipped_local
+
+
+class TestNothingRuns:
+    """Locating modules runs only the standard library: no .pth hook, no cwd module."""
+
+    @pytest.fixture()
+    def hooked_venv(self, tmp_path: Path) -> tuple[str, Path, Path]:
+        venv.create(tmp_path / "venv", with_pip=False, symlinks=sys.platform != "win32")
+        bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+        python = tmp_path / "venv" / bin_dir / ("python.exe" if sys.platform == "win32"
+                                                else "python")
+        site = next((tmp_path / "venv").glob("lib/python*/site-packages"), None)
+        site = site or tmp_path / "venv" / "Lib" / "site-packages"
+        marker = tmp_path / "pth.marker"
+        # a hook like setuptools' distutils-precedence.pth, and a plain path entry
+        (site / "hook.pth").write_text(f"import os; open({str(marker)!r}, 'w').write('x')\n")
+        extra = tmp_path / "extra-path"
+        (extra / "viapth").mkdir(parents=True)
+        (extra / "viapth" / "__init__.py").write_text("")
+        (site / "paths.pth").write_text(f"# comment\n{extra}\n")
+        return str(python), marker, site
+
+    def test_pth_hooks_do_not_run_and_path_entries_count(
+        self, hooked_venv: tuple[str, Path, Path],
+    ) -> None:
+        python, marker, site = hooked_venv
+        results, _ = _batch_import_check(python, {"viapth", "json"})
+        assert results == {"viapth": None, "json": None}
+        assert not marker.exists(), "a .pth import hook ran during the import check"
+        assert site_dirs(python) == [str(site.resolve())]
+
+    def test_modules_in_the_working_directory_are_never_imported(
+        self, hooked_venv: tuple[str, Path, Path], tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        python, marker, _ = hooked_venv
+        project = tmp_path / "project"
+        project.mkdir()
+        cwd_marker = tmp_path / "cwd.marker"
+        (project / "json.py").write_text(f"open({str(cwd_marker)!r}, 'w').write('x')\n")
+        monkeypatch.chdir(project)
+        assert "json" in _get_stdlib_modules(python)
+        assert _batch_import_check(python, {"json"})[0] == {"json": None}
+        assert not cwd_marker.exists(), "json.py from the working directory was imported"
+        assert not marker.exists()
 
 
 class TestBatchImportCheck:

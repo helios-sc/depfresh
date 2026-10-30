@@ -172,6 +172,13 @@ Advisories are counted once: OSV's GHSA and PYSEC records of the same issue are 
 - A requirements file that lists a package `pyproject.toml` pins to a private index is refused: uv cannot pin it there from a requirements file and would ask PyPI (dependency confusion). `--strategy latest` refuses private sources for the same reason.
 - `setup.py` is never executed (or handed to uv, which would run it): a literal `install_requires`/`extras_require` is read with `ast` and audited, anything else is refused, and the file is never edited. Projects with `dynamic` dependencies, local paths and archives in requirements files are refused too (`--ignore-direct-references` skips paths and URLs).
 
+### What runs on your machine
+
+- **The project's code:** never. Imports are read with `ast`, `setup.py` is parsed, and uv is never asked to build the project or a local path (those runs are refused instead).
+- **The import check:** the venv's interpreter runs as `python -I -S` from an empty temporary directory, so the working directory, `PYTHON*` variables and the user site stay off `sys.path`, and no `.pth` hook of an installed package runs. depfresh adds the venv's site-packages itself, reads `.pth` files as text (path entries only) and locates modules without importing them: only the standard library executes.
+- **pip-audit:** `python -I -m pip_audit` from an empty temporary directory, in its own venv; only pip-audit and its dependencies run.
+- **uv:** it resolves and installs third-party packages as your own `uv lock`/`uv sync` would. A dependency that publishes no wheel for this host, or whose metadata uv has to build, is built from its sdist, which runs that package's build backend. `--skip-import-check` installs nothing.
+
 ### Repository advisories (opt-in)
 
 Maintainers can publish an advisory in their own GitHub repository days before it reaches the GitHub Advisory Database, OSV and pip-audit. `--repo-advisories` maps every shipped package to its repository (from its PyPI project URLs), reads the published advisories with `gh api`, and treats the ones that affect the shipped version like any other finding.

@@ -10,13 +10,18 @@ fully pinned set of requirements:
   (SIGABRT) with uv-managed CPython 3.12 on macOS.
 * ``-s osv`` — the OSV service, which carries the GitHub Advisory Database
   and PyPA advisories with their aliases.
-* a pinned pip-audit version range (:data:`PIP_AUDIT_REQUIREMENT`).
+* a pinned pip-audit version range (:data:`PIP_AUDIT_REQUIREMENT`);
+* ``python -I`` from an empty temporary directory, so neither the working
+  directory nor ``PYTHON*`` variables can put modules in front of pip-audit's
+  own.  Only pip-audit and its dependencies run, from the tool venv.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import subprocess
+import tempfile
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -54,7 +59,7 @@ def install_pip_audit(uv: str, tool_dir: Path, python: str) -> tuple[str, str]:
     tool_python = create_venv(uv, tool_dir, python)
     log.info("Installing %s into an isolated tool environment", PIP_AUDIT_REQUIREMENT)
     run([uv, "pip", "install", PIP_AUDIT_REQUIREMENT, "--python", tool_python])
-    result = run([tool_python, "-m", "pip_audit", "--version"], check=False)
+    result = _run_tool([tool_python, "-I", "-m", "pip_audit", "--version"])
     version = result.stdout.strip().split()[-1] if result.returncode == 0 and result.stdout else ""
     version = version or "unknown"
     log.debug("pip-audit version: %s", version)
@@ -69,13 +74,19 @@ def audit_command(tool_python: str, req_path: Path) -> list[str]:
         req_path: Fully pinned requirements file (``name==version`` lines).
     """
     return [
-        tool_python, "-m", "pip_audit",
+        tool_python, "-I", "-m", "pip_audit",
         "-r", str(req_path),
         "--no-deps", "--disable-pip",
         "-s", "osv",
         "--format", "json",
         "--progress-spinner", "off",
     ]
+
+
+def _run_tool(cmd: list[str]) -> subprocess.CompletedProcess[str]:
+    """Run a pip-audit command from an empty temporary directory (never the caller's)."""
+    with tempfile.TemporaryDirectory(prefix="depfresh-audit-") as empty:
+        return run(cmd, cwd=empty, check=False)
 
 
 def write_pinned_requirements(pkgs: dict[str, str], path: Path) -> None:
@@ -158,7 +169,7 @@ def run_audit(tool_python: str, req_path: Path, label: str) -> list[Vulnerabilit
 
 def _audit_file(tool_python: str, req_path: Path, label: str) -> object:
     """Run one pip-audit process over *req_path* and return its decoded JSON."""
-    result = run(audit_command(tool_python, req_path), check=False)
+    result = _run_tool(audit_command(tool_python, req_path))
 
     if result.returncode not in (0, 1):
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
