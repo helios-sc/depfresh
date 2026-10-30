@@ -186,6 +186,12 @@ class UpgradeResult:
     resolution_check: str = ""
     #: Packages in the shipped set that were not audited, with the reason.
     not_audited: list[str] = field(default_factory=list)
+    #: How many packages of the shipped set were audited before the upgrade
+    #: (``None`` for ``--strategy latest``, which does not count them).
+    audited_count: int | None = None
+    #: Audited packages that a non-PyPI index (a mirror or proxy) serves,
+    #: ``{name: index url}``.
+    other_index: dict[str, str] = field(default_factory=dict)
     #: The commands depfresh ran to change the dependency files.
     commands: list[str] = field(default_factory=list)
     #: Files written (or that would be written on a dry run).

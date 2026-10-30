@@ -107,7 +107,7 @@ depfresh /path/to/project --python 3.12 --extra full --reports-dir ./artifacts
 depfresh /path/to/project --strategy latest
 ```
 
-Exit codes: `0` = clean, `1` = error, `2` = vulnerabilities remain, `3` = imports regressed (nothing written).
+Exit codes: `0` = no known vulnerabilities in what was audited, `1` = error, `2` = vulnerabilities remain, nothing was written, or nothing could be audited, `3` = imports regressed (nothing written). Only packages pinned to an index (`[tool.uv.sources]`) or served by an explicit index are private (`indexes.PrivateScope`); everything else is audited by name.
 
 Never execute repository code (no `setup.py`, no building local paths) and never resolve a private-index package against public PyPI.
 

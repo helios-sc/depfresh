@@ -17,6 +17,7 @@ from packaging.version import Version
 from depfresh.advisories import Release, TargetEnv
 from depfresh.constraints import normalise
 from depfresh.exceptions import CommandError, DirectReferenceError, PrivateIndexError
+from depfresh.indexes import PrivateScope
 from depfresh.models import Vulnerability
 from depfresh.parsers import DependencyFormat
 from depfresh.pipmode import (
@@ -58,11 +59,16 @@ class TestParseCompileOutput:
         result = parse_compile_output(text)
         assert result.pins["fastapi"] == "0.129.0"
         assert result.via["starlette"] == {"fastapi"}
-        assert result.private() == {
-            "private-widget": "https://us-east1-python.pkg.dev/acme/python/simple/",
-        }
-        assert "private-widget" not in result.public_pins()
         assert result.direct_refs == ["tool @ git+https://example.com/tool.git"]
+        url = "https://us-east1-python.pkg.dev/acme/python/simple/"
+        pinned = PrivateScope(pinned={"private-widget": "internal"})
+        assert result.private(pinned) == {"private-widget": url}
+        assert "private-widget" not in result.public_pins(pinned)
+        assert result.other_index(pinned) == {}
+        # Not pinned to its index: audited like any other package, and named.
+        assert result.private() == {}
+        assert "private-widget" in result.public_pins()
+        assert result.other_index() == {"private-widget": url}
 
 
 class TestSplitRequirement:
@@ -233,9 +239,11 @@ class FakeResolver:
     """
 
     def __init__(self, universe: dict[str, list[str]],
-                 requires: dict[tuple[str, str], dict[str, str]]) -> None:
+                 requires: dict[tuple[str, str], dict[str, str]],
+                 index: dict[str, str] | None = None) -> None:
         self.universe = universe
         self.requires = requires
+        self.index = index or {}
         self.calls: list[dict[str, Any]] = []
 
     def __call__(self, ws: PipWorkspace, manifest: Path, *, preferences: str | None = None,
@@ -283,7 +291,7 @@ class FakeResolver:
             ):
                 body = "".join(
                     f"{n}=={chosen[n]}  # via {', '.join(sorted(reach[n])) or '-r x'}\n"
-                    "    # from https://pypi.org/simple\n"
+                    f"    # from {self.index.get(n, 'https://pypi.org/simple')}\n"
                     for n in sorted(reach)
                 )
                 return parse_compile_output(body)
@@ -293,8 +301,10 @@ class FakeResolver:
 class FakeAuditor:
     def __init__(self, vulnerable: dict[str, set[str]]) -> None:
         self.vulnerable = vulnerable
+        self.audited: list[dict[str, str]] = []
 
     def audit(self, pins: dict[str, str], label: str) -> list[Vulnerability]:
+        self.audited.append(dict(pins))
         return [Vulnerability(n, v, f"GHSA-{n}", "", "") for n, v in sorted(pins.items())
                 if v in self.vulnerable.get(n, set())]
 
@@ -340,6 +350,65 @@ def _remediate(
             options=options, sources=sources or FakeSources(fixes, resolver.universe),
             venv_name=".venv-upgrade", ignore_direct_references=False,
         )
+
+
+class TestNonPyPIIndexes:
+    MIRROR = "https://mirror.example/api/pypi/simple"
+    PRIVATE = "https://us-east1-python.pkg.dev/acme/python/simple/"
+
+    def test_a_mirror_default_index_is_audited_and_fixed(self, tmp_path: Path) -> None:
+        resolver = FakeResolver({"urllib3": ["2.6.3", "2.8.0"], "six": ["1.17.0"]}, {},
+                                index={"urllib3": self.MIRROR, "six": self.MIRROR})
+        auditor = FakeAuditor({"urllib3": {"2.6.3"}})
+        outcome = _remediate(tmp_path, "urllib3==2.6.3\nsix==1.17.0\n", resolver, {},
+                             {"urllib3": "2.8.0"}, auditor=auditor,
+                             sources=FakeSources({"urllib3": "2.8.0"}, resolver.universe))
+        assert auditor.audited[0] == {"urllib3": "2.6.3", "six": "1.17.0"}
+        assert outcome.new_text == "urllib3==2.8.0\nsix==1.17.0\n"
+        assert outcome.not_audited == []
+        assert outcome.audited_count == 2
+        assert outcome.other_index == {"urllib3": self.MIRROR, "six": self.MIRROR}
+        assert any("not from PyPI" in note for note in outcome.notes)
+
+    def test_a_pinned_private_package_is_never_audited_or_looked_up(
+        self, tmp_path: Path,
+    ) -> None:
+        resolver = FakeResolver({"private-widget": ["0.1.0", "0.2.0"], "six": ["1.17.0"]}, {},
+                                index={"private-widget": self.PRIVATE})
+        text = dedent(f"""\
+            [project]
+            name = "demo-api"
+            version = "0.1.0"
+            dependencies = ["private-widget==0.1.0", "six==1.17.0"]
+
+            [[tool.uv.index]]
+            name = "internal"
+            url = "{self.PRIVATE}"
+
+            [tool.uv.sources]
+            private-widget = {{ index = "internal" }}
+        """)
+
+        def compile_pyproject(ws: PipWorkspace, manifest: Path, **kwargs: Any) -> Resolution:
+            from depfresh.pipmode import PyprojectDocument
+
+            listed = PyprojectDocument(manifest.read_text(), [], False).listed()
+            req_file = manifest.with_name("as-requirements.txt")
+            req_file.write_text("".join(f"{n}{s}\n" for n, s in listed.items()))
+            return resolver(ws, req_file, **kwargs)
+
+        compile_pyproject.universe = resolver.universe  # type: ignore[attr-defined]
+        auditor = FakeAuditor({"private-widget": {"0.1.0"}})
+        sources = FakeSources({}, resolver.universe)
+        outcome = _remediate(tmp_path, text, compile_pyproject,  # type: ignore[arg-type]
+                             {}, {}, fmt=DependencyFormat.PYPROJECT_PEP621,
+                             name="pyproject.toml", auditor=auditor, sources=sources)
+        assert all("private-widget" not in pins for pins in auditor.audited)
+        assert outcome.pre_vulns == []
+        assert outcome.audited_count == 1
+        assert outcome.not_audited == [
+            f"private-widget==0.1.0 (private index {self.PRIVATE}; not audited)",
+        ]
 
 
 class TestRemediatePip:

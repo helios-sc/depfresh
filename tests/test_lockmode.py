@@ -13,6 +13,7 @@ import pytest
 
 from depfresh.advisories import Release, TargetEnv
 from depfresh.exceptions import CommandError, DepfreshError, PrivateIndexError
+from depfresh.indexes import PrivateScope
 from depfresh.lockmode import (
     LockOutcome,
     LockProject,
@@ -70,15 +71,39 @@ class TestShippedSet:
         result = shipped_set(text, ENV, locked)
         assert result.pins == {"anyio": "4.13.0", "jeepney": "0.9.0", "uvloop": "0.22.1"}
 
-    def test_private_index_packages_are_not_audited(self) -> None:
+    def test_pinned_private_packages_are_not_audited(self) -> None:
         locked = read_lock_from(
             text_packages={"private-widget": "0.1.0", "six": "1.17.0"},
             sources={"private-widget": {"registry": PRIVATE}},
         )
-        result = shipped_set("private-widget==0.1.0\nsix==1.17.0\n", ENV, locked)
+        scope = PrivateScope(pinned={"private-widget": PRIVATE})
+        result = shipped_set("private-widget==0.1.0\nsix==1.17.0\n", ENV, locked, scope)
         assert result.pins == {"six": "1.17.0"}
         assert result.private == {"private-widget": "0.1.0"}
         assert any("private index" in line for line in result.not_audited)
+        assert result.other_index == {}
+
+    def test_explicit_index_packages_are_not_audited(self) -> None:
+        locked = read_lock_from(
+            text_packages={"private-widget": "0.1.0"},
+            sources={"private-widget": {"registry": PRIVATE}},
+        )
+        scope = PrivateScope(explicit={PRIVATE.rstrip("/").lower()})
+        result = shipped_set("private-widget==0.1.0\n", ENV, locked, scope)
+        assert (result.pins, result.private) == ({}, {"private-widget": "0.1.0"})
+
+    def test_a_mirror_as_default_index_is_audited_and_named(self) -> None:
+        """A non-PyPI default index serves public packages: they are audited."""
+        mirror = "https://mirror.example/api/pypi/simple"
+        locked = read_lock_from(
+            text_packages={"six": "1.17.0", "idna": "3.11"},
+            sources={"six": {"registry": mirror}, "idna": {"registry": mirror}},
+        )
+        result = shipped_set("idna==3.11\nsix==1.17.0\n", ENV, locked)
+        assert result.pins == {"idna": "3.11", "six": "1.17.0"}
+        assert result.private == {}
+        assert result.not_audited == []
+        assert result.other_index == {"idna": mirror, "six": mirror}
 
     def test_local_and_git_sources_are_reported(self) -> None:
         locked = read_lock_from(
@@ -273,15 +298,18 @@ class FakeProject:
     """
 
     def __init__(self, root: Path, versions: dict[str, str],
-                 rules: dict[str, dict[str, str] | None], pyproject: str) -> None:
+                 rules: dict[str, dict[str, str] | None], pyproject: str,
+                 registry: str = PYPI) -> None:
         self.root = root
         self.root.mkdir(parents=True, exist_ok=True)
         self.versions = dict(versions)
         self.rules = rules
+        self.registry = registry
         self.commands: list[str] = []
         self.pyproject_path.write_text(pyproject)
         self._write_lock()
         self.lock_calls: list[dict[str, str]] = []
+        self.scope = PrivateScope()
 
     @property
     def lock_path(self) -> Path:
@@ -292,7 +320,8 @@ class FakeProject:
         return self.root / "pyproject.toml"
 
     def _write_lock(self) -> None:
-        self.lock_path.write_text(_lock_text(self.versions))
+        sources = {name: {"registry": self.registry} for name in self.versions}
+        self.lock_path.write_text(_lock_text(self.versions, sources))
 
     def export(self, options: RemediationOptions) -> str:
         self.versions = {p.name: p.version for p in read_lock(self.lock_path)[1]}
@@ -482,6 +511,38 @@ class TestRemediateLock:
             "GHSA-bbbb": "No fixed release available yet",
         }
 
+    def test_a_mirror_default_index_is_audited_and_fixed(self, tmp_path: Path) -> None:
+        mirror = "https://mirror.example/api/pypi/simple"
+        auditor = FakeAuditor({"aiohttp": {"3.14.1"}})
+        outcome, project = _run(
+            tmp_path,
+            lambda root: FakeProject(root, self.BASE, {"aiohttp==3.14.4": {}}, PYPROJECT,
+                                     registry=mirror),
+            auditor, FakeSources({"aiohttp": "3.14.4"}, self.RELEASES),
+        )
+        assert auditor.audited[0] == self.BASE
+        assert project.lock_calls == [{"aiohttp": "3.14.4"}]
+        assert outcome.post_vulns == []
+        assert outcome.baseline.other_index == dict.fromkeys(self.BASE, mirror)
+        assert any("not from PyPI" in note and mirror in note for note in outcome.notes)
+
+    def test_pinned_private_package_is_never_audited_or_looked_up(
+        self, tmp_path: Path,
+    ) -> None:
+        auditor = FakeAuditor({"private-widget": {"0.1.0"}})
+        sources = FakeSources({}, {})
+
+        def project(root: Path) -> FakeProject:
+            made = FakeProject(root, {**self.BASE, "private-widget": "0.1.0"}, {}, PYPROJECT,
+                               registry=PRIVATE)
+            made.scope = PrivateScope(pinned={"private-widget": PRIVATE})
+            return made
+
+        outcome, _ = _run(tmp_path, project, auditor, sources)
+        assert all("private-widget" not in pins for pins in auditor.audited)
+        assert outcome.baseline.private == {"private-widget": "0.1.0"}
+        assert outcome.pre_vulns == []
+
     def test_follow_up_round_for_a_vulnerable_co_upgrade(self, tmp_path: Path) -> None:
         auditor = FakeAuditor({"aiohttp": {"3.14.1"}, "yarl": {"1.24.9"}})
         sources = FakeSources({"aiohttp": "3.14.4", "yarl": "1.25.1"},
@@ -655,6 +716,28 @@ class TestSubproject:
         (target / "services" / "api" / "pyproject.toml").write_text(self.SUB)
         (target / "services" / "api" / "uv.lock").write_text("sub lock\n")
         return target
+
+    def test_scope_covers_workspace_members_and_settings(self, tmp_path: Path) -> None:
+        from depfresh.lockmode import LockProject
+
+        target = tmp_path / "ws"
+        (target / "packages" / "core").mkdir(parents=True)
+        (target / "pyproject.toml").write_text(
+            '[project]\nname = "ws"\nversion = "1"\ndependencies = ["core"]\n'
+            '[tool.uv.workspace]\nmembers = ["packages/*"]\n'
+            '[tool.uv.sources]\ncore = { workspace = true }\n'
+        )
+        (target / "packages" / "core" / "pyproject.toml").write_text(
+            '[project]\nname = "core"\nversion = "1"\ndependencies = ["private-widget"]\n'
+            '[tool.uv.sources]\nprivate-widget = { index = "internal" }\n'
+        )
+        (target / "uv.toml").write_text(
+            f'[[index]]\nname = "internal"\nurl = "{PRIVATE}"\nexplicit = true\n'
+        )
+        (target / "uv.lock").write_text(_lock_text({"six": "1.17.0"}))
+        project = LockProject("/usr/bin/uv", target, tmp_path / "work")
+        assert project.scope.pinned == {"private-widget": "internal"}
+        assert project.scope.is_private("other", PRIVATE)
 
     def test_scratch_copy_keeps_the_settings_above_the_subproject(self, tmp_path: Path) -> None:
         from depfresh.lockmode import LockProject

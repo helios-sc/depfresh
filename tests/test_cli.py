@@ -445,6 +445,43 @@ class TestNothingWritten:
         assert exc_info.value.code == 2
         assert "DRY RUN: nothing was written" in capsys.readouterr().out
 
+    def test_unaudited_packages_never_read_as_clean(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        result = _make_result(
+            audited_count=40, not_audited=["private-widget==0.1.0 (private index x)"],
+        )
+        with patch("depfresh.cli.upgrade", return_value=result):
+            main(["/p"])  # exit 0: no known vulnerabilities in what was audited
+        out = capsys.readouterr().out
+        assert "Audited:      40 packages; 1 not audited" in out
+        assert "No known vulnerabilities in the 40 audited packages; 1 shipped" in out
+        assert "All vulnerabilities resolved" not in out
+
+    @pytest.mark.parametrize("audit", [False, True])
+    def test_nothing_audited_exits_2(
+        self, capsys: pytest.CaptureFixture[str], audit: bool,
+    ) -> None:
+        result = _make_result(
+            audited_count=0, not_audited=["private-widget==0.1.0 (private index x)"],
+        )
+        target = "depfresh.cli.audit_only" if audit else "depfresh.cli.upgrade"
+        with patch(target, return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/p", "--audit-only"] if audit else ["/p"])
+        assert exc_info.value.code == 2
+        assert "NOTHING WAS AUDITED" in capsys.readouterr().out
+
+    def test_other_index_is_named(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = _make_result(audited_count=2, other_index={
+            "six": "https://mirror.example/simple", "idna": "https://mirror.example/simple",
+        })
+        with patch("depfresh.cli.upgrade", return_value=result):
+            main(["/p"])
+        out = capsys.readouterr().out
+        assert "Other index:  2 audited packages come from https://mirror.example/simple" in out
+        assert "All vulnerabilities resolved!" in out
+
     def test_clean_dry_run_exits_0(self) -> None:
         result = _make_result(dry_run=True)
         with patch("depfresh.cli.upgrade", return_value=result):

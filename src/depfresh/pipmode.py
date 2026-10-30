@@ -45,6 +45,7 @@ from depfresh.exceptions import (
     DirectReferenceError,
     PrivateIndexError,
 )
+from depfresh.indexes import PrivateScope, other_index_note, private_scope
 from depfresh.lockmode import check_static_dependencies, is_pypi_index
 from depfresh.models import ImportCheck, PackageChange, Vulnerability
 from depfresh.parsers import DependencyFormat
@@ -101,16 +102,26 @@ class Resolution:
     direct_refs: list[str] = field(default_factory=list)
     text: str = ""
 
-    def private(self) -> dict[str, str]:
-        """Packages resolved from an index other than PyPI."""
+    def private(self, scope: PrivateScope | None = None) -> dict[str, str]:
+        """Packages of *scope* (see :mod:`depfresh.indexes`), ``{name: index}``."""
+        scope = scope or PrivateScope()
         return {
-            name: self.index[name] for name in self.pins
-            if name in self.index and not is_pypi_index(self.index[name])
+            name: self.index.get(name) or scope.pinned.get(name, "") for name in self.pins
+            if scope.is_private(name, self.index.get(name))
         }
 
-    def public_pins(self) -> dict[str, str]:
-        private = self.private()
+    def public_pins(self, scope: PrivateScope | None = None) -> dict[str, str]:
+        """The packages to audit: every pin outside *scope*."""
+        private = self.private(scope)
         return {n: v for n, v in self.pins.items() if n not in private}
+
+    def other_index(self, scope: PrivateScope | None = None) -> dict[str, str]:
+        """Audited packages that a non-PyPI index serves, ``{name: url}``."""
+        private = self.private(scope)
+        return {
+            name: self.index[name] for name in self.pins
+            if name not in private and name in self.index and not is_pypi_index(self.index[name])
+        }
 
 
 def parse_compile_output(text: str) -> Resolution:
@@ -548,6 +559,15 @@ class PipWorkspace:
         self.counter = 0
         self._runtime_pins: dict[str, str] | None = None
         self.tree: RequirementsTree | None = None
+        #: What counts as private: the manifest's own pins (pyproject.toml),
+        #: or those of the pyproject.toml files next to a requirements file
+        #: and in the target, plus the explicit indexes of every uv.toml uv
+        #: would read from here.
+        pins = [manifest] if fmt == DependencyFormat.PYPROJECT_PEP621 else [
+            manifest.parent / "pyproject.toml", self.target_dir / "pyproject.toml",
+        ]
+        configs = [d / "uv.toml" for d in (self.target_dir, *self.target_dir.parents)]
+        self.scope = private_scope(dict.fromkeys(pins), configs)
         if fmt != DependencyFormat.PYPROJECT_PEP621:
             self.tree = inspect_tree(manifest, self.target_dir)
             if not ignore_direct_references:
@@ -713,6 +733,8 @@ class PipOutcome:
     gate: ImportGate
     direct_refs: list[str]
     original_text: str = ""
+    audited_count: int | None = None
+    other_index: dict[str, str] = field(default_factory=dict)
 
     def baseline_text_lines(self) -> list[str]:
         return self.original_text.splitlines(keepends=True)
@@ -748,7 +770,7 @@ def remediate_pip(
         raise DirectReferenceError(str(manifest), direct_refs)
 
     baseline = ws.compile(ws.write(original), record=True)
-    private = baseline.private()
+    private = baseline.private(ws.scope)
     not_audited = [f"{n}=={baseline.pins[n]} (private index {url}; not audited)"
                    for n, url in sorted(private.items())]
     not_audited += [f"{ref} (direct reference)" for ref in baseline.direct_refs]
@@ -757,9 +779,14 @@ def remediate_pip(
         manifest.name, options.env.platform, options.env.python_version,
         len(baseline.pins), len(not_audited),
     )
-    pre_vulns = auditor.audit(baseline.public_pins(), "pre-upgrade")
+    audited = baseline.public_pins(ws.scope)
+    other_index = baseline.other_index(ws.scope)
+    pre_vulns = auditor.audit(audited, "pre-upgrade")
     gate = ImportGate(enabled=options.import_check and not audit_only, target_dir=target_dir)
     notes: list[str] = []
+    if other_index:
+        notes.append(other_index_note(other_index))
+        log.warning("%s", notes[-1])
 
     if audit_only:
         return PipOutcome(
@@ -767,7 +794,8 @@ def remediate_pip(
             plans=plan(pre_vulns, baseline.pins, options, sources, private), failures={},
             new_text=original, changed=False, resolution_check="",
             commands=ws.commands, notes=notes, not_audited=not_audited, gate=gate,
-            direct_refs=direct_refs, original_text=original,
+            direct_refs=direct_refs, original_text=original, audited_count=len(audited),
+            other_index=other_index,
         )
 
     venv = work_dir / venv_name
@@ -807,7 +835,7 @@ def remediate_pip(
         except CommandError as exc:
             notes.append(f"Edited manifest does not resolve: {_first_line(exc.stderr)}")
             break
-        current_vulns = auditor.audit(current.public_pins(), f"post-upgrade-{round_no}")
+        current_vulns = auditor.audit(current.public_pins(ws.scope), f"post-upgrade-{round_no}")
         if not current_vulns:
             break
 
@@ -834,7 +862,7 @@ def remediate_pip(
         plans=plans, failures=failures, new_text=new_text, changed=changed,
         resolution_check=resolution_check, commands=ws.commands, notes=notes,
         not_audited=not_audited, gate=gate, direct_refs=direct_refs,
-        original_text=original,
+        original_text=original, audited_count=len(audited), other_index=other_index,
     )
 
 

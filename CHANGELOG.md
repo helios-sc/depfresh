@@ -35,6 +35,7 @@ The default remediation now audits and fixes what actually ships, and moves only
 ### Fixed
 
 - `[tool.uv.sources]` and `[[tool.uv.index]]` are honoured; a private-index package is never looked up on public PyPI, an unreachable private index fails the run, and requirements files that cannot pin a private package to its index are refused.
+- A non-PyPI default index (a mirror or proxy, `UV_INDEX_URL`) no longer makes every package private and the run clean with nothing audited: only packages pinned to an index with `[tool.uv.sources]`, or served by an explicit index, are private; the others are audited by name and the report names their index. The summary gives the audited and not-audited counts, never reports clean while packages went unaudited, and a run that audited nothing exits 2.
 - `setup.py` is never executed; local paths and archives in requirements files are treated as direct references instead of being built.
 - UTF-16 requirements files are read, and written back in their encoding.
 - `--dep-file sub/pyproject.toml` works on that subproject (its lock, its pyproject.toml, its imports, uv run from there) instead of the target's root project; uv workspace members are refused and pointed at the workspace root.

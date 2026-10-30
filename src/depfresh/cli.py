@@ -260,6 +260,7 @@ def main(argv: list[str] | None = None) -> None:
     print(f"  Scope:        {result.dependency_scope}")
     print(f"  Vulns before: {len(result.pre_audit_vulns)}")
     print(f"  Vulns after:  {len(result.post_audit_vulns)}")
+    _print_audit_coverage(result)
     if result.files_changed:
         state = "written" if result.dep_file_updated else "not written"
         print(f"  Files:        {', '.join(result.files_changed)} ({state})")
@@ -293,12 +294,41 @@ def main(argv: list[str] | None = None) -> None:
         sys.exit(code)
 
 
+def _print_audit_coverage(result: UpgradeResult) -> None:
+    """How much of the shipped set was audited, when not all of it was."""
+    if result.not_audited:
+        audited = "?" if result.audited_count is None else str(result.audited_count)
+        print(f"  Audited:      {audited} packages; {len(result.not_audited)} not audited "
+              "(private index, local or direct references; listed in the report)")
+    if result.other_index:
+        urls = ", ".join(sorted(set(result.other_index.values())))
+        print(f"  Other index:  {len(result.other_index)} audited packages come from {urls}, "
+              "not PyPI (see the report)")
+
+
+def coverage_message(result: UpgradeResult) -> tuple[int, list[str]] | None:
+    """The closing lines when part (or all) of the shipped set went unaudited.
+
+    Never a clean result: with nothing audited the run exits 2, and with some
+    packages unaudited the message says how many.
+    """
+    if not result.not_audited:
+        return None
+    unaudited = len(result.not_audited)
+    if result.audited_count == 0:
+        return 2, [f"NOTHING WAS AUDITED: none of the shipped packages could be audited "
+                   f"({unaudited} not audited; listed in the report)."]
+    return 0, [f"No known vulnerabilities in the {result.audited_count} audited packages; "
+               f"{unaudited} shipped packages were not audited (listed in the report)."]
+
+
 def outcome_message(result: UpgradeResult) -> tuple[int, list[str]]:
     """The exit code and closing lines for an upgrade run (import regressions aside).
 
     The code describes the files on disk: when nothing was written (a dry run,
     or a write-back withheld by a failed check) the vulnerabilities found before
-    the run are still there, so the run exits 2 if there were any.
+    the run are still there, so the run exits 2 if there were any.  A run that
+    left part of the shipped set unaudited never reports clean.
     """
     before, after = len(result.pre_audit_vulns), len(result.post_audit_vulns)
     if result.write_back_skipped:
@@ -315,6 +345,9 @@ def outcome_message(result: UpgradeResult) -> tuple[int, list[str]]:
         ]
     if after:
         return 2, [f"WARNING: {after} vulnerabilities remain."]
+    coverage = coverage_message(result)
+    if coverage is not None:
+        return coverage
     return 0, ["All vulnerabilities resolved!"]
 
 
@@ -333,8 +366,16 @@ def _print_audit(result: UpgradeResult) -> None:
         print(f"    {fix.package} {fix.current} -> {target} [{fix.status}] {fix.reason}")
     for line in result.not_audited:
         print(f"  Not audited:  {line}")
+    _print_audit_coverage(result)
     if result.pre_audit_vulns:
         sys.exit(2)
+    coverage = coverage_message(result)
+    if coverage is not None:
+        print()
+        for line in coverage[1]:
+            print(f"  {line}")
+        if coverage[0]:
+            sys.exit(coverage[0])
 
 
 if __name__ == "__main__":

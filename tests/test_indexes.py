@@ -12,9 +12,12 @@ import pytest
 from depfresh.cli import main
 from depfresh.exceptions import DirectReferenceError
 from depfresh.indexes import (
+    PrivateScope,
     PrivateSourceError,
     check_requirements_against_sources,
+    explicit_index_urls,
     foreign_sources,
+    private_scope,
     uv_source_indexes,
 )
 from depfresh.parsers import (
@@ -71,6 +74,34 @@ class TestUvSourceIndexes:
 
     def test_missing_file(self, tmp_path: Path) -> None:
         assert uv_source_indexes(tmp_path / "pyproject.toml") == {}
+
+
+class TestPrivateScope:
+    """Only pinned packages and explicit indexes are private; any other index is audited."""
+
+    def test_pins_and_explicit_indexes(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text(PRIVATE_PYPROJECT)
+        (tmp_path / "uv.toml").write_text(
+            '[[index]]\nname = "vendor"\nurl = "https://vendor.example/simple/"\n'
+            "explicit = true\n"
+            '[[index]]\nname = "mirror"\nurl = "https://mirror.example/simple"\n'
+            "default = true\n"
+        )
+        scope = private_scope([tmp_path / "pyproject.toml"], [tmp_path / "uv.toml"])
+        assert scope.pinned == {"private-widget": PRIVATE}
+        assert scope.explicit == {PRIVATE.rstrip("/"), "https://vendor.example/simple"}
+        assert scope.is_private("Private_Widget", None)
+        assert scope.is_private("anything", "https://vendor.example/simple")
+        assert not scope.is_private("six", "https://mirror.example/simple")
+        assert not scope.is_private("six", None)
+
+    def test_missing_files_give_an_empty_scope(self, tmp_path: Path) -> None:
+        scope = private_scope([tmp_path / "pyproject.toml"], [tmp_path / "uv.toml"])
+        assert scope == PrivateScope()
+
+    def test_explicit_urls_of_a_pyproject(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text(PRIVATE_PYPROJECT)
+        assert explicit_index_urls(tmp_path / "pyproject.toml") == {PRIVATE.rstrip("/")}
 
 
 class TestRequirementsAgainstSources:

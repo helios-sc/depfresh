@@ -836,6 +836,8 @@ def _lock_result(
         lock_changes=outcome.lock_changes,
         lock_check=outcome.lock_check,
         not_audited=outcome.baseline.not_audited,
+        audited_count=len(outcome.baseline.pins),
+        other_index=dict(outcome.baseline.other_index),
         commands=outcome.commands,
         files_changed=files,
         notes=[*outcome.notes, *gate.notes, *(f"Removed from the shipped set: {c.name} "
@@ -1004,6 +1006,8 @@ def _pip_result(
         fixes=fixes,
         resolution_check=outcome.resolution_check,
         not_audited=outcome.not_audited,
+        audited_count=outcome.audited_count,
+        other_index=dict(outcome.other_index),
         commands=outcome.commands,
         files_changed=[str(manifest.path.relative_to(manifest.target_dir))]
         if outcome.changed else [],

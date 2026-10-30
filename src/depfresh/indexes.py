@@ -9,12 +9,23 @@ uv honours the project's index configuration when it is handed the project
 itself (``uv lock``, ``uv export``, ``uv pip compile pyproject.toml``), which
 is how the lock-aware and resolved modes run.  It cannot when the package
 name arrives in a plain requirements file, so those runs are refused.
+
+What is private (:class:`PrivateScope`): the packages a project pins to a
+non-PyPI index with ``[tool.uv.sources]``, and anything an ``explicit = true``
+index serves (uv uses an explicit index for pinned packages only).  They are
+never audited and their names are never sent to PyPI or OSV.  Every other
+package is audited by name, whichever index serves it: a mirror or proxy set
+as the default index (``UV_INDEX_URL``, ``[[tool.uv.index]] default = true``)
+serves public packages, and treating them as private would leave the whole
+shipped set unaudited.  Reports name those indexes.
 """
 
 from __future__ import annotations
 
 import sys
 import urllib.parse
+from collections.abc import Iterable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -64,6 +75,66 @@ def uv_source_indexes(pyproject: Path) -> dict[str, str]:
                 if not _is_pypi(url):
                     pinned[normalise(str(name))] = url
     return pinned
+
+
+def _url_key(url: str) -> str:
+    return url.strip().rstrip("/").lower()
+
+
+def explicit_index_urls(path: Path) -> set[str]:
+    """URLs of the ``explicit = true`` indexes of a pyproject.toml or uv.toml."""
+    data = _load(path)
+    entries = data.get("index") if path.name == "uv.toml" else (
+        data.get("tool", {}).get("uv", {}).get("index")
+    )
+    return {
+        _url_key(str(entry["url"])) for entry in entries or []
+        if isinstance(entry, dict) and entry.get("explicit") and entry.get("url")
+    }
+
+
+@dataclass
+class PrivateScope:
+    """The packages depfresh never audits and never looks up (see the module docstring).
+
+    Attributes:
+        pinned: ``{package: index}`` for every package ``[tool.uv.sources]``
+            pins to a non-PyPI index.
+        explicit: Normalised URLs of the explicit indexes.
+    """
+
+    pinned: dict[str, str] = field(default_factory=dict)
+    explicit: set[str] = field(default_factory=set)
+
+    def is_private(self, name: str, index_url: str | None) -> bool:
+        """True for a pinned package, or one an explicit index served."""
+        if normalise(name) in self.pinned:
+            return True
+        return bool(index_url) and _url_key(str(index_url)) in self.explicit
+
+
+def private_scope(pyprojects: Iterable[Path], config_files: Iterable[Path] = ()) -> PrivateScope:
+    """Collect the pins and explicit indexes of *pyprojects* and uv.toml *config_files*."""
+    scope = PrivateScope()
+    for path in [*pyprojects, *config_files]:
+        if not path.is_file():
+            continue
+        if path.name != "uv.toml":
+            scope.pinned.update(uv_source_indexes(path))
+        scope.explicit |= explicit_index_urls(path)
+    return scope
+
+
+def other_index_note(audited: dict[str, str]) -> str:
+    """The report note for packages audited although a non-PyPI index served them."""
+    urls = sorted(set(audited.values()))
+    return (
+        f"{len(audited)} audited packages come from {', '.join(urls)}, not from PyPI. "
+        "depfresh audited them by name against the public advisory database (OSV): only "
+        "packages pinned to an index with [tool.uv.sources], or served by an explicit "
+        "index, count as private. Pin private packages that way so their names never "
+        "leave their index."
+    )
 
 
 def foreign_sources(manifest: Path) -> list[str]:

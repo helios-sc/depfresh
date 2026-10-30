@@ -121,7 +121,7 @@ depfresh /path/to/project --strategy latest
 | `--reports-dir` | `./reports/` | Report output directory |
 | `-v, --verbose` | off | Debug output |
 
-**Exit codes:** `0` = clean, `1` = error (nothing written), `2` = vulnerabilities remain, `3` = imports regressed (nothing written).
+**Exit codes:** `0` = no known vulnerabilities in what was audited (the summary says how many shipped packages, if any, were not audited), `1` = error (nothing written), `2` = vulnerabilities remain, nothing was written, or nothing could be audited, `3` = imports regressed (nothing written).
 
 </details>
 
@@ -166,7 +166,9 @@ Advisories are counted once: OSV's GHSA and PYSEC records of the same issue are 
 
 ### Private indexes and repository code
 
-- uv runs on the project itself, from the target directory, so `[[tool.uv.index]]`, `[tool.uv.sources]` and `uv.toml` apply. Packages from a non-PyPI index are reported as not audited and are never looked up on PyPI. An unreachable private index fails the run; there is no fallback to PyPI.
+- uv runs on the project itself, from its directory, so `[[tool.uv.index]]`, `[tool.uv.sources]` and `uv.toml` apply. An unreachable private index fails the run; there is no fallback to PyPI.
+- Private means pinned: a package that `[tool.uv.sources]` pins to a non-PyPI index, or that an `explicit = true` index serves, is reported as not audited, and its name is never sent to PyPI or OSV. Every other package is audited by name, whichever index serves it: a mirror or proxy set as the default index (`UV_INDEX_URL`, `default = true`) serves public packages, and the report names that index. Pin private packages to their index, as uv recommends against dependency confusion, so their names never leave it.
+- A run never reports clean while shipped packages went unaudited: the summary gives the audited and not-audited counts, and a run that could audit nothing exits 2.
 - A requirements file that lists a package `pyproject.toml` pins to a private index is refused: uv cannot pin it there from a requirements file and would ask PyPI (dependency confusion). `--strategy latest` refuses private sources for the same reason.
 - `setup.py` is never executed (or handed to uv, which would run it): a literal `install_requires`/`extras_require` is read with `ast` and audited, anything else is refused, and the file is never edited. Projects with `dynamic` dependencies, local paths and archives in requirements files are refused too (`--ignore-direct-references` skips paths and URLs).
 

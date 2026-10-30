@@ -42,6 +42,7 @@ from packaging.version import InvalidVersion, Version
 from depfresh.advisories import AdvisorySources, FixPlan, TargetEnv, evaluate_marker
 from depfresh.constraints import admit_version, normalise
 from depfresh.exceptions import CommandError, DepfreshError, PrivateIndexError
+from depfresh.indexes import PrivateScope, other_index_note, private_scope
 from depfresh.models import ImportCheck, PackageChange, Vulnerability
 from depfresh.remediation import (
     Auditor,
@@ -153,19 +154,29 @@ class ShippedSet:
     """The exported lock, evaluated for the deploy platform.
 
     Attributes:
-        pins: PyPI packages that ship, ``{name: version}`` (audited).
-        private: Packages from another index, ``{name: version}`` (not audited,
-            never looked up on PyPI).
+        pins: Registry packages that ship, ``{name: version}`` (audited).
+        private: Packages of the :class:`~depfresh.indexes.PrivateScope`,
+            ``{name: version}`` (not audited, never looked up).
         not_audited: Human-readable lines for everything not audited.
+        other_index: Audited packages a non-PyPI index serves, ``{name: url}``.
     """
 
     pins: dict[str, str] = field(default_factory=dict)
     private: dict[str, str] = field(default_factory=dict)
     not_audited: list[str] = field(default_factory=list)
+    other_index: dict[str, str] = field(default_factory=dict)
 
 
-def shipped_set(export_text: str, env: TargetEnv, locked: list[LockedPackage]) -> ShippedSet:
-    """Parse ``uv export`` output into the set that ships on *env*."""
+def shipped_set(
+    export_text: str, env: TargetEnv, locked: list[LockedPackage],
+    scope: PrivateScope | None = None,
+) -> ShippedSet:
+    """Parse ``uv export`` output into the set that ships on *env*.
+
+    Packages of *scope* are private; any other registry package is audited,
+    whichever index serves it (see :mod:`depfresh.indexes`).
+    """
+    scope = scope or PrivateScope()
     sources = {(p.name, p.version): p for p in locked}
     result = ShippedSet()
     for raw in export_text.splitlines():
@@ -197,12 +208,14 @@ def shipped_set(export_text: str, env: TargetEnv, locked: list[LockedPackage]) -
         if locked_pkg is not None and locked_pkg.kind != "registry":
             result.not_audited.append(f"{name}=={version} ({locked_pkg.kind} source)")
             continue
-        if locked_pkg is not None and not is_pypi_index(locked_pkg.registry):
+        registry = locked_pkg.registry if locked_pkg is not None else None
+        if scope.is_private(name, registry):
             result.private[name] = version
-            result.not_audited.append(
-                f"{name}=={version} (private index {locked_pkg.registry}; not audited)"
-            )
+            where = registry or scope.pinned.get(name, "")
+            result.not_audited.append(f"{name}=={version} (private index {where}; not audited)")
             continue
+        if registry and not is_pypi_index(registry):
+            result.other_index[name] = registry
         result.pins[name] = version
     return result
 
@@ -264,7 +277,8 @@ class LockProject:
         full_copy = _needs_full_copy(pyproject)
         if full_copy:
             self._check_paths_inside(pyproject)
-        check_static_project(target_dir)
+        pyprojects = check_static_project(target_dir)
+        config_files = [target_dir / "uv.toml"]
         base = work_dir / "project"
         self.root = base
         if context_dir is not None and target_dir.resolve() != context_dir.resolve():
@@ -274,9 +288,12 @@ class LockProject:
             for ancestor in [context, *(context / part for part in _prefixes(relative))]:
                 dest = base / ancestor.relative_to(context)
                 dest.mkdir(parents=True, exist_ok=True)
+                config_files.append(ancestor / "uv.toml")
                 for name in _ANCESTOR_FILES:
                     if (ancestor / name).is_file():
                         shutil.copy2(ancestor / name, dest / name)
+        #: What counts as private (pins and explicit indexes of every project).
+        self.scope = private_scope(pyprojects, config_files)
         if full_copy:
             shutil.copytree(target_dir, self.root, ignore=_COPY_IGNORE, symlinks=True)
         else:
@@ -433,7 +450,7 @@ def check_not_workspace_member(project_dir: Path, manifest: Path) -> None:
         )
 
 
-def check_static_project(project_dir: Path) -> None:
+def check_static_project(project_dir: Path) -> list[Path]:
     """Refuse a uv project that ``uv lock`` would have to build.
 
     Checks the project, every workspace member and every path dependency
@@ -442,9 +459,13 @@ def check_static_project(project_dir: Path) -> None:
     directory with only ``setup.py``/``setup.cfg`` is refused, a wheel is fine
     and any other archive is refused.
 
+    Returns:
+        The ``pyproject.toml`` of every project checked.
+
     Raises:
         DepfreshError: For the first project that is not static.
     """
+    checked: list[Path] = []
     seen: set[Path] = set()
     pending = [project_dir.resolve()]
     while pending:
@@ -465,6 +486,7 @@ def check_static_project(project_dir: Path) -> None:
                 "lock it; depfresh never executes repository code"
             )
         check_static_dependencies(data, pyproject_path, _LOCK_STATIC_FIELDS)
+        checked.append(pyproject_path)
         tool_uv = data.get("tool", {}).get("uv", {})
         workspace = tool_uv.get("workspace") or {}
         excluded: set[Path] = set()
@@ -492,6 +514,7 @@ def check_static_project(project_dir: Path) -> None:
                         "would build it to lock the project, and depfresh never executes "
                         "repository code"
                     )
+    return checked
 
 
 def _first_error_line(text: str) -> str:
@@ -642,7 +665,7 @@ def remediate_lock(
     revision_before, locked_before = read_lock(project.lock_path)
     local = sorted(p.name for p in locked_before if p.kind in ("path", "editable", "directory"))
 
-    baseline = shipped_set(project.export(options), options.env, locked_before)
+    baseline = shipped_set(project.export(options), options.env, locked_before, project.scope)
     log.info(
         "Locked set for %s/%s: %d audited packages, %d not audited",
         options.env.platform, options.env.python_version,
@@ -655,6 +678,9 @@ def remediate_lock(
     plans: dict[str, FixPlan] = {}
     failures: dict[str, str] = {}
     notes: list[str] = []
+    if baseline.other_index:
+        notes.append(other_index_note(baseline.other_index))
+        log.warning("%s", notes[-1])
     current = baseline
     current_vulns = pre_vulns
     pyproject_before = project.pyproject_path.read_text(encoding="utf-8")
@@ -688,7 +714,8 @@ def remediate_lock(
                  ", ".join(f"{n}=={v}" for n, v in sorted(targets.items())))
         _apply_targets(project, targets, baseline, options, failures, notes)
         attempted.update(targets)
-        current = shipped_set(project.export(options), options.env, read_lock(project.lock_path)[1])
+        current = shipped_set(project.export(options), options.env,
+                              read_lock(project.lock_path)[1], project.scope)
         current_vulns = auditor.audit(current.pins, f"post-upgrade-{round_no}")
         if not current_vulns:
             break
@@ -799,7 +826,8 @@ def _disallowed_cobumps(
 ) -> list[PackageChange]:
     """Packages other than *targets* that the update moved across a major version."""
     try:
-        after = shipped_set(project.export(options), options.env, read_lock(project.lock_path)[1])
+        after = shipped_set(project.export(options), options.env,
+                            read_lock(project.lock_path)[1], project.scope)
     except CommandError:
         return []
     changed, _, _, _ = diff_sets(baseline.pins, after.pins, set())

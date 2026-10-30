@@ -310,6 +310,21 @@ def _md_summary(md: list[str], report: UpgradeResult) -> None:
         f"and **{len(report.post_audit_vulns)}** after the upgrade."
     )
     md.append("")
+    if report.not_audited:
+        if report.audited_count == 0:
+            md.append(f"**Nothing was audited:** none of the {len(report.not_audited)} shipped "
+                      "packages could be audited (see Not Audited below).")
+        else:
+            md.append(f"**{len(report.not_audited)} shipped packages were not audited** "
+                      "(private index, local or direct references; see Not Audited below).")
+        md.append("")
+    if report.other_index:
+        urls = ", ".join(f"`{u}`" for u in sorted(set(report.other_index.values())))
+        md.append(f"**{len(report.other_index)} audited packages come from {urls}, not PyPI:** "
+                  "they were audited by name against the public advisory database. Only "
+                  "packages pinned to an index with `[tool.uv.sources]`, or served by an "
+                  "explicit index, count as private.")
+        md.append("")
     if report.write_back_skipped:
         md.append(
             f"**Nothing was written** ({report.write_back_skipped}): the files on disk still "
