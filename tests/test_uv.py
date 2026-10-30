@@ -126,15 +126,15 @@ class TestInstalledNames:
 
 
 class TestFreeze:
-    def test_excludes_static_audit_tools(self) -> None:
+    def test_keeps_packages_pip_audit_also_uses(self) -> None:
+        """pip-audit runs from its own env, so rich/msgpack/platformdirs are project packages."""
         mock_result = MagicMock()
-        mock_result.stdout = "flask==2.3.0\npip-audit==2.7.0\npip==23.0\nrequests==2.31.0\n"
+        mock_result.stdout = "flask==2.3.0\nmsgpack==1.0.5\nplatformdirs==4.2.0\nrich==13.7.0\n"
         with patch("depfresh.uv.run", return_value=mock_result):
             pkgs = freeze("/usr/bin/uv", "/path/to/python")
-        assert "flask" in pkgs
-        assert "requests" in pkgs
-        assert "pip-audit" not in pkgs
-        assert "pip" not in pkgs
+        assert pkgs == {
+            "flask": "2.3.0", "msgpack": "1.0.5", "platformdirs": "4.2.0", "rich": "13.7.0",
+        }
 
     def test_extra_exclude(self) -> None:
         mock_result = MagicMock()

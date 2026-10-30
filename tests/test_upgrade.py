@@ -194,18 +194,18 @@ def _mock_venv_python(tmp_path: Path) -> str:
 
 def _make_setup_venv_mock(
     tmp_path: Path,
-    pip_audit_deps: frozenset[str] | None = None,
     old_pkgs: dict[str, str] | None = None,
 ) -> MagicMock:
     return MagicMock(
         return_value=(
             _mock_venv_python(tmp_path),
             "3.11.5",
-            "2.7.0",
-            pip_audit_deps or frozenset(),
             old_pkgs or {"flask": "2.3.0"},
         )
     )
+
+
+_AUDIT_TOOL = ("/tool/bin/python", "2.10.1")
 
 
 class TestUpgradeHappyPath:
@@ -221,6 +221,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
             patch.object(_upgrade_mod, "build_constraints", return_value=["flask>=2.3.0,<3"]),
             patch.object(_upgrade_mod, "install_packages"),
@@ -241,6 +242,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
             patch.object(_upgrade_mod, "build_constraints", return_value=[]),
             patch.object(_upgrade_mod, "install_packages"),
@@ -260,6 +262,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", side_effect=[[vuln], []]),
             patch.object(_upgrade_mod, "build_constraints", return_value=[]),
             patch.object(_upgrade_mod, "install_packages"),
@@ -280,6 +283,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(
                 _upgrade_mod, "_run_audit_with_temp", side_effect=RuntimeError("audit boom"),
             ),
@@ -296,6 +300,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", side_effect=[[], [vuln]]),
             patch.object(_upgrade_mod, "build_constraints", return_value=[]),
             patch.object(_upgrade_mod, "install_packages"),
@@ -320,6 +325,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
             patch.object(_upgrade_mod, "build_constraints", return_value=[]),
             patch.object(_upgrade_mod, "install_packages", side_effect=error),
@@ -343,6 +349,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
             patch.object(_upgrade_mod, "build_constraints", return_value=[]),
             patch.object(_upgrade_mod, "install_packages"),
@@ -372,6 +379,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
             patch.object(_upgrade_mod, "build_constraints", return_value=[]),
             patch.object(_upgrade_mod, "install_packages"),
@@ -401,6 +409,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
             patch.object(_upgrade_mod, "build_constraints", return_value=[]),
             patch.object(_upgrade_mod, "install_packages"),
@@ -438,13 +447,12 @@ class TestAuditOnly:
 
     def test_returns_upgrade_result(self, tmp_path: Path) -> None:
         (tmp_path / "requirements.txt").write_text("flask==2.3.0\n")
-        setup_mock = MagicMock(
-            return_value=("/venv/bin/python", "3.11.5", "2.7.0", frozenset(), {"flask": "2.3.0"})
-        )
+        setup_mock = MagicMock(return_value=("/venv/bin/python", "3.11.5", {"flask": "2.3.0"}))
         with (
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
@@ -456,13 +464,12 @@ class TestAuditOnly:
         """audit_only stores findings in pre_audit_vulns (no upgrade, no post)."""
         (tmp_path / "requirements.txt").write_text("urllib3==2.0.0\n")
         vuln = Vulnerability("urllib3", "2.0.0", "CVE-2023-001", "2.0.6", "desc")
-        setup_mock = MagicMock(
-            return_value=("/venv/bin/python", "3.11.5", "2.7.0", frozenset(), {"urllib3": "2.0.0"})
-        )
+        setup_mock = MagicMock(return_value=("/venv/bin/python", "3.11.5", {"urllib3": "2.0.0"}))
         with (
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[vuln]),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
@@ -472,13 +479,12 @@ class TestAuditOnly:
 
     def test_cleanup_venv_called_even_on_error(self, tmp_path: Path) -> None:
         (tmp_path / "requirements.txt").write_text("flask==2.3.0\n")
-        setup_mock = MagicMock(
-            return_value=("/venv/bin/python", "3.11.5", "2.7.0", frozenset(), {"flask": "2.3.0"})
-        )
+        setup_mock = MagicMock(return_value=("/venv/bin/python", "3.11.5", {"flask": "2.3.0"}))
         with (
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", side_effect=RuntimeError("boom")),
             patch.object(_upgrade_mod, "cleanup_venv") as mock_cleanup,
         ):
@@ -486,38 +492,69 @@ class TestAuditOnly:
                 audit_only(tmp_path)
         mock_cleanup.assert_called_once()
 
-    def test_pip_audit_deps_used_in_setup_venv(self, tmp_path: Path) -> None:
-        """Regression test: pip_audit_deps from install_pip_audit must reach freeze.
+    def test_pip_audit_runs_from_an_isolated_tool_env(self, tmp_path: Path) -> None:
+        """pip-audit is never installed into the project venv.
 
-        Before the fix, audit_only() discarded pip_audit_deps (_), meaning
-        _setup_venv could not use them when calling freeze() for unpinned formats.
-        Now _setup_venv installs pip-audit before freezing, so its deps are
-        always excluded from the baseline.
+        Earlier releases installed pip-audit next to the project's packages and
+        then dropped pip-audit's dependencies (rich, msgpack, platformdirs…)
+        from the frozen set, which also hid the project's own copies of those
+        packages from the audit.
         """
         req_file = tmp_path / "requirements.in"
-        req_file.write_text("flask\n")  # unpinned — triggers freeze inside _setup_venv
+        req_file.write_text("flask\nmsgpack\n")  # unpinned — triggers freeze inside _setup_venv
 
-        pip_audit_deps = frozenset({"rich", "pip-api"})
-        freeze_mock = MagicMock(return_value={"flask": "2.3.0"})
+        freeze_mock = MagicMock(return_value={"flask": "2.3.0", "msgpack": "1.0.5"})
+        audit_mock = MagicMock(return_value=[])
+        install_tool = MagicMock(return_value=_AUDIT_TOOL)
+        installed_into: list[str] = []
+
+        def install_capture(uv: str, venv_python: str, req_path: Path) -> None:
+            installed_into.append(venv_python)
 
         with (
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
             patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
             patch.object(_upgrade_mod, "create_venv", return_value="/venv/bin/python"),
-            patch.object(_upgrade_mod, "install_requirements"),
-            patch.object(_upgrade_mod, "install_pip_audit", return_value=("2.7.0", pip_audit_deps)),
+            patch.object(_upgrade_mod, "install_requirements", side_effect=install_capture),
+            patch.object(_upgrade_mod, "install_pip_audit", install_tool),
             patch.object(_upgrade_mod, "freeze", freeze_mock),
             patch.object(_upgrade_mod, "run", return_value=MagicMock(stdout="Python 3.11.5\n")),
-            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
-            patch.object(_upgrade_mod, "cleanup_venv"),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", audit_mock),
         ):
             audit_only(tmp_path)
 
-        # freeze must have been called with pip_audit_deps as extra_exclude
-        assert any(
-            c.kwargs.get("extra_exclude") == pip_audit_deps
-            for c in freeze_mock.call_args_list
-        )
+        # The tool env lives in depfresh's work dir, not in the project venv.
+        tool_dir = install_tool.call_args.args[1]
+        assert tool_dir.name == ".pip-audit-tool"
+        assert installed_into == ["/venv/bin/python"]
+        # Every frozen package is audited, msgpack included, with the tool interpreter.
+        assert audit_mock.call_args.args[0] == "/tool/bin/python"
+        assert audit_mock.call_args.args[2] == {"flask": "2.3.0", "msgpack": "1.0.5"}
+
+    def test_work_dir_removed_when_install_fails(self, tmp_path: Path) -> None:
+        """An install failure before the audit must not leave a venv behind."""
+        (tmp_path / "requirements.txt").write_text("flask==2.3.0\n")
+        created: list[Path] = []
+
+        def fake_create(uv: str, venv_path: Path, python: str) -> str:
+            venv_path.mkdir(parents=True)
+            created.append(venv_path)
+            return str(venv_path / "bin" / "python")
+
+        error = CommandError(["uv", "pip", "install"], 1, "no solution")
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
+            patch.object(_upgrade_mod, "create_venv", side_effect=fake_create),
+            patch.object(_upgrade_mod, "install_requirements", side_effect=error),
+        ):
+            with pytest.raises(CommandError):
+                upgrade(tmp_path, label="test", reports_dir=tmp_path / "reports")
+
+        assert created, "venv should have been created before the failure"
+        assert not created[0].exists()
+        assert not created[0].parent.exists()  # the whole work dir is gone
+        assert not list(tmp_path.glob(".venv-upgrade*"))
 
 
 class TestSetupVenv:
@@ -533,7 +570,6 @@ class TestSetupVenv:
         with (
             patch.object(_upgrade_mod, "create_venv", return_value="/venv/bin/python"),
             patch.object(_upgrade_mod, "install_requirements", side_effect=install_capture),
-            patch.object(_upgrade_mod, "install_pip_audit", return_value=("2.7.0", frozenset())),
             patch.object(
                 _upgrade_mod, "freeze", return_value={"flask": "2.4.0", "requests": "2.32.0"},
             ),
@@ -569,4 +605,4 @@ class TestSetupVenv:
         assert "requests==2.31.0" in str(seen["content"])
         assert seen["exists_during_install"] is True
         assert not temp_req.exists()
-        assert _setup_venv_result[4]["flask"] == "2.4.0"
+        assert _setup_venv_result[2]["flask"] == "2.4.0"

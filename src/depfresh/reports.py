@@ -250,7 +250,7 @@ def _md_steps(md: list[str], report: UpgradeResult) -> None:
     md.append("")
     md.append("### 2. Ran initial vulnerability audit (pip-audit)")
     md.append("```bash")
-    md.append("pip-audit -r <temp-requirements> --format json")
+    md.append("pip-audit -r <pinned-requirements> --no-deps --disable-pip -s osv --format json")
     md.append("```")
     md.append(f"**Result:** {len(report.pre_audit_vulns)} known vulnerabilities found.")
     md.append("")
@@ -275,7 +275,7 @@ def _md_steps(md: list[str], report: UpgradeResult) -> None:
     md.append("")
     md.append("### 5. Ran post-upgrade vulnerability audit")
     md.append("```bash")
-    md.append("pip-audit -r <temp-requirements> --format json")
+    md.append("pip-audit -r <pinned-requirements> --no-deps --disable-pip -s osv --format json")
     md.append("```")
     remaining = len(report.post_audit_vulns)
     if remaining == 0:

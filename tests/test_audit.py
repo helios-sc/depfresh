@@ -8,7 +8,14 @@ from unittest.mock import MagicMock, patch
 
 import pytest
 
-from depfresh.audit import _parse_pip_audit_json, run_audit
+from depfresh.audit import (
+    PIP_AUDIT_REQUIREMENT,
+    _parse_pip_audit_json,
+    audit_command,
+    install_pip_audit,
+    run_audit,
+    write_pinned_requirements,
+)
 from depfresh.exceptions import AuditError
 
 
@@ -173,7 +180,76 @@ class TestParsePipAuditJson:
         assert _parse_pip_audit_json(json.dumps(data)) == []
 
 
+class TestAuditCommand:
+    def test_audits_exact_pins_without_resolving(self, tmp_path: Path) -> None:
+        """--no-deps --disable-pip: pip-audit must not build its own resolver venv."""
+        cmd = audit_command("/tool/bin/python", tmp_path / "pins.txt")
+        assert cmd[:3] == ["/tool/bin/python", "-m", "pip_audit"]
+        assert "--no-deps" in cmd
+        assert "--disable-pip" in cmd
+
+    def test_uses_osv_service(self, tmp_path: Path) -> None:
+        cmd = audit_command("/tool/bin/python", tmp_path / "pins.txt")
+        assert cmd[cmd.index("-s") + 1] == "osv"
+
+    def test_reads_the_given_requirements_file(self, tmp_path: Path) -> None:
+        req = tmp_path / "pins.txt"
+        cmd = audit_command("/tool/bin/python", req)
+        assert cmd[cmd.index("-r") + 1] == str(req)
+
+
+class TestInstallPipAudit:
+    def test_pins_a_version_range(self) -> None:
+        assert PIP_AUDIT_REQUIREMENT.startswith("pip-audit>=")
+        assert "<3" in PIP_AUDIT_REQUIREMENT
+
+    def test_installs_into_its_own_venv(self, tmp_path: Path) -> None:
+        tool_dir = tmp_path / "tool"
+        version_result = MagicMock(returncode=0, stdout="pip-audit 2.10.1\n")
+        with (
+            patch("depfresh.audit.create_venv", return_value="/tool/bin/python") as mock_venv,
+            patch("depfresh.audit.run", return_value=version_result) as mock_run,
+        ):
+            python, version = install_pip_audit("/usr/bin/uv", tool_dir, "3.12")
+
+        assert python == "/tool/bin/python"
+        assert version == "2.10.1"
+        mock_venv.assert_called_once_with("/usr/bin/uv", tool_dir, "3.12")
+        install_cmd = mock_run.call_args_list[0].args[0]
+        assert install_cmd[:3] == ["/usr/bin/uv", "pip", "install"]
+        assert PIP_AUDIT_REQUIREMENT in install_cmd
+        assert install_cmd[install_cmd.index("--python") + 1] == "/tool/bin/python"
+
+    def test_unknown_version_when_version_call_fails(self, tmp_path: Path) -> None:
+        results = [MagicMock(returncode=0, stdout=""), MagicMock(returncode=1, stdout="")]
+        with (
+            patch("depfresh.audit.create_venv", return_value="/tool/bin/python"),
+            patch("depfresh.audit.run", side_effect=results),
+        ):
+            _, version = install_pip_audit("/usr/bin/uv", tmp_path / "tool", "3.11")
+        assert version == "unknown"
+
+
+class TestWritePinnedRequirements:
+    def test_writes_sorted_exact_pins(self, tmp_path: Path) -> None:
+        out = tmp_path / "pins.txt"
+        write_pinned_requirements({"zlib": "1.0", "Flask": "2.3.0"}, out)
+        assert out.read_text() == "Flask==2.3.0\nzlib==1.0\n"
+
+    def test_skips_unversioned_entries(self, tmp_path: Path) -> None:
+        out = tmp_path / "pins.txt"
+        write_pinned_requirements({"flask": "*", "requests": ""}, out)
+        assert out.read_text() == ""
+
+
 class TestRunAudit:
+    def test_empty_input_is_not_sent_to_pip_audit(self, tmp_path: Path) -> None:
+        req = tmp_path / "reqs.txt"
+        req.write_text("")
+        with patch("depfresh.audit.run") as mock_run:
+            assert run_audit("/tool/bin/python", req, "test") == []
+        mock_run.assert_not_called()
+
     def test_calls_pip_audit_with_json_format(self, tmp_path: Path) -> None:
         req = tmp_path / "reqs.txt"
         req.write_text("flask==2.3.0\n")

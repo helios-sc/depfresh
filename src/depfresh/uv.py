@@ -119,7 +119,13 @@ def freeze(
     venv_python: str,
     extra_exclude: frozenset[str] | None = None,
 ) -> dict[str, str]:
-    """Freeze current environment, excluding pip-audit tooling.
+    """Freeze the current environment.
+
+    pip-audit runs from its own tool environment (see
+    :func:`depfresh.audit.install_pip_audit`), so every package in this
+    environment belongs to the project and is reported.  Earlier releases
+    dropped a static list of pip-audit's dependencies here, which also hid
+    the project's own ``msgpack``, ``rich``, ``platformdirs``… from the audit.
 
     Parameters
     ----------
@@ -128,29 +134,16 @@ def freeze(
     venv_python:
         Path to the Python binary inside the venv.
     extra_exclude:
-        Additional package names to exclude beyond the static baseline.
-        Pass the set returned by :func:`install_pip_audit` to ensure all
-        of pip-audit's transitive dependencies are filtered out.
+        Package names to leave out of the result.
 
     Returns
     -------
     dict[str, str]
         ``{normalised_name: version}``
     """
-    log.info("Freezing upgraded environment")
+    log.info("Freezing environment")
     result = run([uv, "pip", "freeze", "--python", venv_python])
-
-    # Static baseline: packages that pip-audit is known to install.
-    # Extended dynamically via extra_exclude to catch transitive deps
-    # that vary across pip-audit versions.
-    audit_deps: frozenset[str] = frozenset({
-        "pip", "pip-audit", "pip-api", "pip-requirements-parser",
-        "boolean-py", "cachecontrol", "cyclonedx-python-lib",
-        "defusedxml", "filelock", "license-expression", "markdown-it-py",
-        "mdurl", "msgpack", "packageurl-python", "platformdirs",
-        "py-serializable", "pygments", "rich", "tomli", "tomli-w",
-    })
-    exclude = audit_deps | (extra_exclude or frozenset())
+    exclude = extra_exclude or frozenset()
 
     pkgs: dict[str, str] = {}
     for line in result.stdout.splitlines():
@@ -163,7 +156,7 @@ def freeze(
             if name not in exclude:
                 pkgs[name] = m.group(2)
 
-    log.info("Frozen %d packages (excluded pip-audit tooling)", len(pkgs))
+    log.info("Frozen %d packages", len(pkgs))
     return pkgs
 
 

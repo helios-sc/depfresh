@@ -5,10 +5,12 @@ from __future__ import annotations
 import datetime
 import logging
 import os
+import shutil
+import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 
-from depfresh.audit import install_pip_audit, run_audit
+from depfresh.audit import install_pip_audit, run_audit, write_pinned_requirements
 from depfresh.constraints import (
     build_constraints,
     compute_changes,
@@ -20,7 +22,6 @@ from depfresh.models import DependencyScope, DependencySpec, UpgradeResult, Vuln
 from depfresh.parsers import (
     DependencyFormat,
     FormatHandler,
-    RequirementsSimpleHandler,
     detect_dep_file,
     detect_format,
     get_handler,
@@ -108,7 +109,7 @@ def _resolve_dep_file(
 
 def _setup_venv(
     uv: str,
-    target_dir: Path,
+    work_dir: Path,
     venv_path: Path,
     python: str,
     handler: FormatHandler,
@@ -116,21 +117,19 @@ def _setup_venv(
     old_pkgs: dict[str, str],
     req_path: Path,
     use_original_requirements: bool,
-) -> tuple[str, str, str, frozenset[str], dict[str, str]]:
-    """Create venv, install user deps, install pip-audit, freeze if needed.
+) -> tuple[str, str, dict[str, str]]:
+    """Create the project venv, install the user's dependencies, freeze if needed.
 
-    pip-audit is installed *before* the optional freeze so that its
-    transitive dependencies can be excluded from the frozen baseline via
-    ``extra_exclude``.
+    pip-audit is *not* installed here: it runs from its own tool environment
+    (see :func:`depfresh.audit.install_pip_audit`), so this venv holds only
+    the project's packages.
 
     Returns
     -------
     tuple
-        ``(venv_python, actual_py_version, pip_audit_version,
-           pip_audit_deps, resolved_pkgs)``
-        where *resolved_pkgs* equals *old_pkgs* for pinned formats, or the
-        output of :func:`depfresh.uv.freeze` (pip-audit deps excluded) for
-        unpinned formats.
+        ``(venv_python, actual_py_version, resolved_pkgs)`` where
+        *resolved_pkgs* equals *old_pkgs* for pinned formats, or the output of
+        :func:`depfresh.uv.freeze` for unpinned formats.
     """
     venv_python = create_venv(uv, venv_path, python)
 
@@ -139,41 +138,38 @@ def _setup_venv(
     else:
         # Generate a temp requirements file that preserves the selected scope,
         # markers, and extras for formats that cannot be installed directly.
-        temp_install = target_dir / f".depfresh_install_{_RUN_ID}.tmp"
+        temp_install = work_dir / f".depfresh_install_{_RUN_ID}.tmp"
         _write_installable_requirements(temp_install, install_deps)
         try:
             install_requirements(uv, venv_python, temp_install)
         finally:
             temp_install.unlink(missing_ok=True)
 
-    # Install pip-audit first so its deps are known before we freeze
-    pip_audit_version, pip_audit_deps = install_pip_audit(uv, venv_python)
-
     resolved_pkgs = old_pkgs
     if not handler.is_pinned:
-        resolved_pkgs = freeze(uv, venv_python, extra_exclude=pip_audit_deps)
+        resolved_pkgs = freeze(uv, venv_python)
         log.info("Resolved %d actual installed versions via freeze", len(resolved_pkgs))
 
     py_ver_result = run([venv_python, "--version"])
     actual_py_version = py_ver_result.stdout.strip().replace("Python ", "")
 
-    return venv_python, actual_py_version, pip_audit_version, pip_audit_deps, resolved_pkgs
+    return venv_python, actual_py_version, resolved_pkgs
 
 
 def _run_audit_with_temp(
-    venv_python: str,
-    target_dir: Path,
+    audit_python: str,
+    work_dir: Path,
     pkgs: dict[str, str],
     label: str,
 ) -> list[Vulnerability]:
-    """Write *pkgs* to a temp requirements file, run pip-audit, delete the file.
+    """Write *pkgs* to a temp pinned requirements file, run pip-audit, delete the file.
 
     The temp file is always removed, even when :func:`run_audit` raises.
     """
-    tmp = target_dir / f".depfresh_audit_{label}_{_RUN_ID}.tmp"
-    RequirementsSimpleHandler().write(pkgs, tmp)
+    tmp = work_dir / f".depfresh_audit_{label}_{_RUN_ID}.tmp"
+    write_pinned_requirements(pkgs, tmp)
     try:
-        return run_audit(venv_python, tmp, label)
+        return run_audit(audit_python, tmp, label)
     finally:
         tmp.unlink(missing_ok=True)
 
@@ -188,13 +184,20 @@ class _CommonSetup:
     handler: FormatHandler
     uv: str
     uv_version: str
+    work_dir: Path
     venv_path: Path
     venv_python: str
+    audit_python: str
     actual_py_version: str
     pip_audit_version: str
-    pip_audit_deps: frozenset[str]
     old_pkgs: dict[str, str]
     ignored_direct_refs: list[str]
+
+
+def _cleanup_work_dir(work_dir: Path, venv_path: Path) -> None:
+    """Remove the temporary venv and depfresh's work directory."""
+    cleanup_venv(venv_path)
+    shutil.rmtree(work_dir, ignore_errors=True)
 
 
 def _prepare_run(
@@ -208,16 +211,17 @@ def _prepare_run(
     ignore_direct_references: bool,
     log_header: str,
 ) -> _CommonSetup:
-    """Validate inputs, resolve the dep file, create venv, and install deps.
+    """Validate inputs, resolve the dep file, create venvs, and install deps.
 
-    Shared between :func:`upgrade` and :func:`audit_only`.
+    Shared between :func:`upgrade` and :func:`audit_only`.  Everything depfresh
+    creates lives in a temporary work directory outside the target, which is
+    removed again if any step here fails.
     """
     target_dir = Path(target).expanduser().resolve()
     if not target_dir.is_dir():
         raise TargetNotFoundError(str(target_dir))
 
     req_path, dep_format, handler = _resolve_dep_file(target_dir, dep_file, fmt)
-    venv_path = target_dir / f"{venv_name}-{_RUN_ID}"
     uv = find_uv()
     uv_version = get_uv_version(uv)
 
@@ -247,18 +251,26 @@ def _prepare_run(
         and not ignored_direct_refs
     )
 
-    (venv_python, actual_py_version, pip_audit_version,
-     pip_audit_deps, old_pkgs) = _setup_venv(
-        uv,
-        target_dir,
-        venv_path,
-        python,
-        handler,
-        install_deps,
-        old_pkgs,
-        req_path,
-        use_original_requirements,
-    )
+    work_dir = Path(tempfile.mkdtemp(prefix=f"depfresh-{_RUN_ID}-"))
+    venv_path = work_dir / venv_name
+    try:
+        venv_python, actual_py_version, old_pkgs = _setup_venv(
+            uv,
+            work_dir,
+            venv_path,
+            python,
+            handler,
+            install_deps,
+            old_pkgs,
+            req_path,
+            use_original_requirements,
+        )
+        audit_python, pip_audit_version = install_pip_audit(
+            uv, work_dir / ".pip-audit-tool", python,
+        )
+    except BaseException:
+        _cleanup_work_dir(work_dir, venv_path)
+        raise
 
     return _CommonSetup(
         target_dir=target_dir,
@@ -267,11 +279,12 @@ def _prepare_run(
         handler=handler,
         uv=uv,
         uv_version=uv_version,
+        work_dir=work_dir,
         venv_path=venv_path,
         venv_python=venv_python,
+        audit_python=audit_python,
         actual_py_version=actual_py_version,
         pip_audit_version=pip_audit_version,
-        pip_audit_deps=pip_audit_deps,
         old_pkgs=old_pkgs,
         ignored_direct_refs=ignored_direct_refs,
     )
@@ -418,11 +431,11 @@ def upgrade(
         out_dir = Path.cwd() / "reports" / service_label
     out_dir.mkdir(parents=True, exist_ok=True)
 
-    constraints_path = ctx.target_dir / f".depfresh_constraints_{_RUN_ID}.txt"
+    constraints_path = ctx.work_dir / f".depfresh_constraints_{_RUN_ID}.txt"
 
     try:
         pre_vulns = _run_audit_with_temp(
-            ctx.venv_python, ctx.target_dir, ctx.old_pkgs, "pre-upgrade",
+            ctx.audit_python, ctx.work_dir, ctx.old_pkgs, "pre-upgrade",
         )
 
         log.info("Building upgrade constraints")
@@ -434,16 +447,16 @@ def upgrade(
 
         install_packages(ctx.uv, ctx.venv_python, constraints_path)
 
-        new_pkgs = freeze(ctx.uv, ctx.venv_python, extra_exclude=ctx.pip_audit_deps)
+        new_pkgs = freeze(ctx.uv, ctx.venv_python)
 
         import_check = verify_imports(ctx.target_dir, ctx.venv_python)
 
         post_vulns = _run_audit_with_temp(
-            ctx.venv_python, ctx.target_dir, new_pkgs, "post-upgrade",
+            ctx.audit_python, ctx.work_dir, new_pkgs, "post-upgrade",
         )
     finally:
         constraints_path.unlink(missing_ok=True)
-        cleanup_venv(ctx.venv_path)
+        _cleanup_work_dir(ctx.work_dir, ctx.venv_path)
 
     vuln_packages = {normalise(v.package) for v in pre_vulns}
     upgraded, new_deps, unchanged = compute_changes(ctx.old_pkgs, new_pkgs, vuln_packages)
@@ -528,9 +541,9 @@ def audit_only(
     )
 
     try:
-        vulns = _run_audit_with_temp(ctx.venv_python, ctx.target_dir, ctx.old_pkgs, "audit")
+        vulns = _run_audit_with_temp(ctx.audit_python, ctx.work_dir, ctx.old_pkgs, "audit")
     finally:
-        cleanup_venv(ctx.venv_path)
+        _cleanup_work_dir(ctx.work_dir, ctx.venv_path)
 
     return UpgradeResult(
         date=datetime.date.today().isoformat(),

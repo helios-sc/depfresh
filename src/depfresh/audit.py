@@ -1,74 +1,122 @@
-"""pip-audit integration — install, run, and parse vulnerability reports."""
+"""pip-audit integration — install, run, and parse vulnerability reports.
+
+pip-audit runs from its own isolated virtual environment, never from the
+environment that holds the audited packages, and it audits an exact,
+fully pinned set of requirements:
+
+* ``--no-deps --disable-pip`` — the input is already a complete resolution,
+  so pip-audit must not resolve it again.  Resolving mode makes pip-audit
+  build a copy-mode virtual environment with ``ensurepip``, which aborts
+  (SIGABRT) with uv-managed CPython 3.12 on macOS.
+* ``-s osv`` — the OSV service, which carries the GitHub Advisory Database
+  and PyPA advisories with their aliases.
+* a pinned pip-audit version range (:data:`PIP_AUDIT_REQUIREMENT`).
+"""
 
 from __future__ import annotations
 
 import json
 import logging
-import os
 from pathlib import Path
 
 from depfresh.exceptions import AuditError
 from depfresh.models import Vulnerability
-from depfresh.uv import installed_names, run
+from depfresh.uv import create_venv, run
 
 log = logging.getLogger("depfresh")
 
+#: The pip-audit releases depfresh is tested against.  2.9 is the first
+#: release whose JSON output and ``--no-deps --disable-pip`` behaviour match
+#: what :func:`run_audit` expects; 3.x may change the CLI.
+PIP_AUDIT_REQUIREMENT = "pip-audit>=2.9.0,<3"
 
-def install_pip_audit(uv: str, venv_python: str) -> tuple[str, frozenset[str]]:
-    """Install pip-audit into the venv.
 
-    Returns ``(version, added_package_names)`` where *added_package_names*
-    is the set of package names introduced by pip-audit and its dependencies.
-    Pass this set to :func:`depfresh.uv.freeze` as ``extra_exclude`` so that
-    pip-audit's transitive dependencies are not mistaken for user packages.
+def install_pip_audit(uv: str, tool_dir: Path, python: str) -> tuple[str, str]:
+    """Create an isolated virtual environment holding a pinned pip-audit.
+
+    The audited packages are never installed next to pip-audit, so
+    pip-audit's own dependencies (``rich``, ``msgpack``, ``platformdirs``…)
+    can neither shadow nor hide the project's copies of those packages.
+
+    Args:
+        uv: Path to the ``uv`` binary.
+        tool_dir: Directory for the tool environment.  It is created (or
+            replaced) and should live in depfresh's temporary work directory.
+        python: Python version request for the tool environment.
+
+    Returns:
+        ``(tool_python, version)``: the interpreter of the tool environment and
+        the installed pip-audit version (``"unknown"`` if it cannot be read).
     """
-    before = installed_names(uv, venv_python)
-    log.info("Installing pip-audit")
-    run([uv, "pip", "install", "pip-audit", "--python", venv_python])
-    after = installed_names(uv, venv_python)
-    added = after - before
-    log.debug("pip-audit introduced %d package(s): %s", len(added), sorted(added))
-
-    venv_bin = str(Path(venv_python).parent)
-    pip_audit_bin = os.path.join(venv_bin, "pip-audit")
-    result = run([pip_audit_bin, "--version"], check=False)
-    version = result.stdout.strip().split()[-1] if result.returncode == 0 else "unknown"
+    tool_python = create_venv(uv, tool_dir, python)
+    log.info("Installing %s into an isolated tool environment", PIP_AUDIT_REQUIREMENT)
+    run([uv, "pip", "install", PIP_AUDIT_REQUIREMENT, "--python", tool_python])
+    result = run([tool_python, "-m", "pip_audit", "--version"], check=False)
+    version = result.stdout.strip().split()[-1] if result.returncode == 0 and result.stdout else ""
+    version = version or "unknown"
     log.debug("pip-audit version: %s", version)
-    return version, added
+    return tool_python, version
 
 
-def run_audit(venv_python: str, req_path: Path, label: str) -> list[Vulnerability]:
-    """Run pip-audit against a requirements file.
+def audit_command(tool_python: str, req_path: Path) -> list[str]:
+    """Return the pip-audit command line used for every audit.
 
-    Parameters
-    ----------
-    venv_python:
-        Path to the Python binary inside the venv.
-    req_path:
-        Path to the requirements file to audit.
-    label:
-        Human label for logging (e.g. ``"pre-upgrade"`` or ``"post-upgrade"``).
+    Args:
+        tool_python: Interpreter of the pip-audit tool environment.
+        req_path: Fully pinned requirements file (``name==version`` lines).
+    """
+    return [
+        tool_python, "-m", "pip_audit",
+        "-r", str(req_path),
+        "--no-deps", "--disable-pip",
+        "-s", "osv",
+        "--format", "json",
+        "--progress-spinner", "off",
+    ]
 
-    Returns
-    -------
-    list[Vulnerability]
-        Vulnerabilities found.
+
+def write_pinned_requirements(pkgs: dict[str, str], path: Path) -> None:
+    """Write ``name==version`` lines for :func:`run_audit`.
+
+    Packages without a concrete version (``"*"``) cannot be audited with
+    ``--no-deps`` and are left out; callers report them separately.
+    """
+    lines = [f"{name}=={ver}" for name, ver in sorted(pkgs.items()) if ver and ver != "*"]
+    path.write_text("\n".join(lines) + "\n" if lines else "")
+
+
+def run_audit(tool_python: str, req_path: Path, label: str) -> list[Vulnerability]:
+    """Run pip-audit against a fully pinned requirements file.
+
+    Args:
+        tool_python: Interpreter of the pip-audit tool environment (see
+            :func:`install_pip_audit`).
+        req_path: Path to the pinned requirements file to audit.
+        label: Human label for logging (e.g. ``"pre-upgrade"``).
+
+    Returns:
+        The vulnerabilities found.
+
+    Raises:
+        AuditError: If pip-audit fails or produces no valid JSON.  depfresh
+            fails closed: a broken audit never reads as a clean one.
     """
     log.info("Running vulnerability audit (%s)", label)
-    venv_bin = str(Path(venv_python).parent)
-    pip_audit_bin = os.path.join(venv_bin, "pip-audit")
-    result = run([pip_audit_bin, "-r", str(req_path), "--format", "json"], check=False)
+    if not req_path.read_text().strip():
+        log.info("Audit (%s): nothing to audit", label)
+        return []
+    result = run(audit_command(tool_python, req_path), check=False)
 
     if result.returncode not in (0, 1):
         detail = result.stderr.strip() or result.stdout.strip() or "no output"
         raise AuditError(
-            f"pip-audit failed during {label} with exit code {result.returncode}: {detail[:500]}"
+            f"pip-audit failed during {label} with exit code {result.returncode}: {detail[-800:]}"
         )
 
     if not result.stdout.strip():
         detail = result.stderr.strip() or "no output"
         raise AuditError(
-            f"pip-audit produced no JSON output during {label}: {detail[:500]}"
+            f"pip-audit produced no JSON output during {label}: {detail[-800:]}"
         )
 
     try:
@@ -76,7 +124,7 @@ def run_audit(venv_python: str, req_path: Path, label: str) -> list[Vulnerabilit
     except json.JSONDecodeError as exc:
         detail = result.stderr.strip() or result.stdout.strip()
         raise AuditError(
-            f"pip-audit produced invalid JSON during {label}: {detail[:500]}"
+            f"pip-audit produced invalid JSON during {label}: {detail[-800:]}"
         ) from exc
 
     vulns = _parse_pip_audit_data(data)

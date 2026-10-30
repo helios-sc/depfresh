@@ -125,6 +125,11 @@ if sys.argv[1:] == ["--version"]:
     print("Python {python_version}.9")
     raise SystemExit(0)
 
+if sys.argv[1:3] == ["-m", "pip_audit"]:
+    import os
+    pip_audit = str(Path(__file__).resolve().parent / "pip-audit")
+    os.execv(pip_audit, [pip_audit, *sys.argv[3:]])
+
 if len(sys.argv) >= 3 and sys.argv[1] == "-c":
     code = sys.argv[2]
     if "stdlib_module_names" in code:
@@ -248,7 +253,7 @@ def main() -> int:
         state = load_state(venv_python)
         packages = dict(state["packages"])
 
-        if "pip-audit" in args:
+        if any(arg.startswith("pip-audit") for arg in args):
             packages["pip-audit"] = "2.8.0"
             packages["pip-api"] = "0.1.0"
             packages["rich"] = "13.9.4"
