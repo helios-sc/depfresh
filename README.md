@@ -100,7 +100,7 @@ depfresh /path/to/project --strategy latest
 |--------|---------|-------------|
 | `target_dir` | *(required)* | Directory containing the dependency file |
 | `--label` | auto-derived | Report subfolder name |
-| `--dep-file` | auto-detect | Dependency file name (see [Supported formats](#supported-formats)) |
+| `--dep-file` | auto-detect | Dependency file, relative to `target_dir` (see [Supported formats](#supported-formats)); `sub/pyproject.toml` works on that subproject only |
 | `--format` | auto-detect | Force format: `requirements-simple`, `requirements-hashed`, `requirements-in`, `pyproject-pep621`, `pyproject-poetry`, `pipfile`, `setup-py` |
 | `--strategy` | `minimal` | `minimal`: move only vulnerable packages to their lowest fix. `latest`: upgrade every package within its bounds (resolved on this machine) |
 | `--python` | `3.11` | Deploy Python version to resolve and audit for |
@@ -139,6 +139,8 @@ When `uv.lock` sits next to `pyproject.toml`, the lock is what `uv sync --frozen
 4. `uv lock --check`, and an import check between the installed baseline and remediated locks.
 
 The write-back is the updated `uv.lock`. `pyproject.toml` is edited only when a direct dependency's own constraint excludes the fix (for example `cryptography>=41,<47` when the fix is 50.0.0, with `--allow-major cryptography`). uv may rewrite the lock header to its current revision; the report says so.
+
+With `--dep-file services/api/pyproject.toml` the run works on that subproject: its `uv.lock`, its `pyproject.toml` and the imports of its code, with the uv settings (`uv.toml`, `[tool.uv]`) and `.python-version` files of the directories in between. A workspace member is refused, with or without its own lock: what ships is the workspace's `uv.lock`, so run depfresh on the workspace root.
 
 ### Everything else: resolved for the deploy platform
 
@@ -305,6 +307,7 @@ if result.pre_audit_vulns:
 - In lock-aware mode uv chooses the version of a required co-upgrade (the newest compatible one); in resolved mode depfresh pins the lowest that resolves.
 - Poetry and Pipfile projects are supported only by `--strategy latest`, which resolves on the machine running depfresh.
 - Operates on a single dependency file per run; `-r`/`-c` includes are followed only inside the target directory, and workspace path dependencies only inside the project.
+- In lock-aware mode uv runs on a scratch copy of the project. User-level uv configuration and `UV_*` environment variables apply, and so do the settings of the directories between the target and the project, but not those of directories above the target: point depfresh at the directory that holds them.
 
 <details>
 <summary><strong>Known edge cases</strong></summary>

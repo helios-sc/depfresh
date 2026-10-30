@@ -370,7 +370,8 @@ def _run(
 ) -> tuple[LockOutcome, FakeProject]:
     created: list[FakeProject] = []
 
-    def factory(uv: str, target_dir: Path, work_dir: Path) -> FakeProject:
+    def factory(uv: str, target_dir: Path, work_dir: Path,
+                context_dir: Path | None = None) -> FakeProject:
         created.append(project_factory(work_dir / "project"))
         return created[-1]
 
@@ -635,6 +636,147 @@ class TestUpgradeLockMode:
         assert "| fastmcp | 3.4.2 | 3.4.10 | patch |" in content
         assert "uv lock --upgrade-package fastmcp==3.4.10" in content
         assert "- [x] `uv lock --check`: passed" in content
+
+
+class TestSubproject:
+    """--dep-file sub/pyproject.toml works on that subproject, never on the root."""
+
+    ROOT = '[project]\nname = "root-app"\nversion = "1"\ndependencies = ["six==1.17.0"]\n'
+    SUB = '[project]\nname = "sub-app"\nversion = "1"\ndependencies = ["fastmcp>=3.4.2"]\n'
+
+    def _tree(self, tmp_path: Path, *, root: bool = True) -> Path:
+        target = tmp_path / "repo"
+        (target / "services" / "api").mkdir(parents=True)
+        if root:
+            (target / "pyproject.toml").write_text(self.ROOT)
+            (target / "uv.lock").write_text("root lock\n")
+        (target / "uv.toml").write_text('index-url = "https://mirror.example/simple"\n')
+        (target / "services" / ".python-version").write_text("3.12\n")
+        (target / "services" / "api" / "pyproject.toml").write_text(self.SUB)
+        (target / "services" / "api" / "uv.lock").write_text("sub lock\n")
+        return target
+
+    def test_scratch_copy_keeps_the_settings_above_the_subproject(self, tmp_path: Path) -> None:
+        from depfresh.lockmode import LockProject
+
+        target = self._tree(tmp_path)
+        project = LockProject("/usr/bin/uv", target / "services" / "api", tmp_path / "work",
+                              context_dir=target)
+        base = tmp_path / "work" / "project"
+        assert project.root == base / "services" / "api"
+        assert project.pyproject_path.read_text() == self.SUB
+        assert project.lock_path.read_text() == "sub lock\n"
+        assert (base / "uv.toml").is_file()
+        assert (base / "pyproject.toml").read_text() == self.ROOT
+        assert (base / "services" / ".python-version").is_file()
+        assert not (base / "uv.lock").exists()
+
+    @pytest.mark.parametrize("root", [True, False])
+    def test_writes_only_the_subproject(self, tmp_path: Path, root: bool) -> None:
+        target = self._tree(tmp_path, root=root)
+        sub = target / "services" / "api"
+        outcome = TestUpgradeLockMode._outcome(tmp_path)
+        outcome.new_pyproject = b"new sub pyproject\n"
+        outcome.pyproject_diff = "-old\n+new\n"
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.13.6"),
+            patch.object(_upgrade_mod, "install_pip_audit",
+                         return_value=("/tool/bin/python", "2.10.1")),
+            patch.object(_upgrade_mod, "remediate_lock", return_value=outcome) as mock,
+        ):
+            result = upgrade(target, label="x", dep_file="services/api/pyproject.toml",
+                             reports_dir=tmp_path / "reports", python="3.12")
+        assert mock.call_args.kwargs["target_dir"] == sub
+        assert mock.call_args.kwargs["context_dir"] == target
+        assert (sub / "uv.lock").read_text() == "new lock\n"
+        assert (sub / "pyproject.toml").read_text() == "new sub pyproject\n"
+        if root:
+            assert (target / "uv.lock").read_text() == "root lock\n"
+            assert (target / "pyproject.toml").read_text() == self.ROOT
+        assert result.requirements_path == "services/api/uv.lock"
+        assert result.files_changed == ["services/api/uv.lock", "services/api/pyproject.toml"]
+
+    def test_import_check_scans_the_subproject(self, tmp_path: Path) -> None:
+        target = self._tree(tmp_path)
+        sub = target / "services" / "api"
+        made: list[tuple[Path, Path | None]] = []
+
+        def factory(uv: str, project_dir: Path, work_dir: Path,
+                    context_dir: Path | None = None) -> FakeProject:
+            made.append((project_dir, context_dir))
+            return FakeProject(work_dir / "project", {"fastmcp": "3.4.2"}, {}, self.SUB)
+
+        with patch("depfresh.lockmode.LockProject", side_effect=factory):
+            outcome = remediate_lock(
+                uv="/usr/bin/uv", target_dir=sub, work_dir=tmp_path / "work",
+                auditor=FakeAuditor({}),  # type: ignore[arg-type]
+                options=RemediationOptions(env=ENV, import_check=False),
+                sources=FakeSources({}, {}),  # type: ignore[arg-type]
+                venv_name=".venv-upgrade", context_dir=target,
+            )
+        assert made == [(sub, target)]
+        assert outcome.gate.target_dir == sub
+
+
+class TestWorkspaceMembers:
+    """A workspace member ships from the workspace's lock: depfresh refuses it."""
+
+    @staticmethod
+    def _workspace(tmp_path: Path, workspace: str, member_lock: bool = False) -> Path:
+        root = tmp_path / "ws"
+        member = root / "packages" / "api"
+        member.mkdir(parents=True)
+        (root / "pyproject.toml").write_text(
+            '[project]\nname = "ws"\nversion = "1"\ndependencies = []\n' + workspace
+        )
+        (root / "uv.lock").write_text("workspace lock\n")
+        (member / "pyproject.toml").write_text(
+            '[project]\nname = "api"\nversion = "1"\ndependencies = ["six"]\n'
+        )
+        if member_lock:
+            (member / "uv.lock").write_text("stale member lock\n")
+        return root
+
+    @pytest.mark.parametrize(("workspace", "member"), [
+        ('[tool.uv.workspace]\nmembers = ["packages/*"]\n', True),
+        ('[tool.uv.workspace]\nmembers = ["packages/api"]\n', True),
+        ('[tool.uv.workspace]\nmembers = ["packages/*"]\nexclude = ["packages/api"]\n', False),
+        ('[tool.uv.workspace]\nmembers = ["libs/*"]\n', False),
+        ("", False),
+    ])
+    def test_membership_follows_uv(self, tmp_path: Path, workspace: str, member: bool) -> None:
+        from depfresh.lockmode import workspace_root_of
+
+        root = self._workspace(tmp_path, workspace)
+        found = workspace_root_of(root / "packages" / "api")
+        assert found == (root.resolve() if member else None)
+
+    def test_only_the_nearest_pyproject_counts(self, tmp_path: Path) -> None:
+        """uv stops at the first pyproject.toml above the project, as here."""
+        from depfresh.lockmode import workspace_root_of
+
+        root = self._workspace(tmp_path, '[tool.uv.workspace]\nmembers = ["packages/**"]\n')
+        (root / "packages" / "pyproject.toml").write_text(
+            '[project]\nname = "group"\nversion = "1"\n'
+        )
+        assert workspace_root_of(root / "packages" / "api") is None
+
+    @pytest.mark.parametrize("member_lock", [False, True])
+    @pytest.mark.parametrize("how", ["dep-file", "target"])
+    def test_member_runs_are_refused(self, tmp_path: Path, member_lock: bool, how: str) -> None:
+        root = self._workspace(tmp_path, '[tool.uv.workspace]\nmembers = ["packages/*"]\n',
+                               member_lock=member_lock)
+        with (
+            patch.object(_upgrade_mod, "find_uv") as find_uv,
+            pytest.raises(DepfreshError, match="belongs to the uv workspace at"),
+        ):
+            if how == "dep-file":
+                upgrade(root, dep_file="packages/api/pyproject.toml", python="3.12")
+            else:
+                upgrade(root / "packages" / "api", python="3.12")
+        assert not find_uv.called
+        assert (root / "uv.lock").read_text() == "workspace lock\n"
 
 
 class TestLockProjectCommands:

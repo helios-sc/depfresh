@@ -521,6 +521,92 @@ class TestImportRegressionGate:
         assert "fastmcp==4.1.4" in req.read_text()
 
 
+class TestSubprojectPyproject:
+    """--dep-file sub/pyproject.toml without a lock: resolved mode on that subproject."""
+
+    ROOT = '[project]\nname = "root-app"\nversion = "1"\ndependencies = ["six==1.17.0"]\n'
+    SUB = '[project]\nname = "sub-app"\nversion = "1"\ndependencies = ["idna==3.6"]\n'
+
+    def _tree(self, tmp_path: Path) -> Path:
+        target = tmp_path / "repo"
+        (target / "sub").mkdir(parents=True)
+        (target / "pyproject.toml").write_text(self.ROOT)
+        (target / "sub" / "pyproject.toml").write_text(self.SUB)
+        return target
+
+    def test_uv_runs_in_the_subproject(self, tmp_path: Path) -> None:
+        from depfresh.advisories import TargetEnv
+        from depfresh.parsers import DependencyFormat
+        from depfresh.pipmode import PipWorkspace
+        from depfresh.remediation import RemediationOptions
+
+        sub = self._tree(tmp_path) / "sub"
+        ws = PipWorkspace("/usr/bin/uv", sub, sub / "pyproject.toml",
+                          DependencyFormat.PYPROJECT_PEP621, tmp_path / "work",
+                          RemediationOptions(env=TargetEnv("3.12")),
+                          ignore_direct_references=False)
+        result = MagicMock(stdout="idna==3.6  # via sub-app\n", stderr="")
+        with patch("depfresh.pipmode.run", return_value=result) as mock:
+            ws.compile(ws.write(self.SUB))
+        assert mock.call_args.kwargs["cwd"] == sub.resolve()
+
+    def test_writes_only_the_subproject(self, tmp_path: Path) -> None:
+        from depfresh.pipmode import PipOutcome, Resolution
+        from depfresh.remediation import ImportGate
+
+        target = self._tree(tmp_path)
+        sub = target / "sub"
+        new_text = self.SUB.replace("idna==3.6", "idna==3.15")
+        outcome = PipOutcome(
+            baseline=Resolution(pins={"idna": "3.6"}), final=Resolution(pins={"idna": "3.15"}),
+            pre_vulns=[Vulnerability("idna", "3.6", "GHSA-x", "3.15", "")], post_vulns=[],
+            plans={}, failures={}, new_text=new_text, changed=True,
+            resolution_check="passed", commands=[], notes=[], not_audited=[],
+            gate=ImportGate(False, sub), direct_refs=[], original_text=self.SUB,
+        )
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.13.6"),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
+            patch.object(_upgrade_mod, "remediate_pip", return_value=outcome) as mock,
+        ):
+            result = upgrade(target, dep_file="sub/pyproject.toml", python="3.12",
+                             reports_dir=tmp_path / "reports")
+        assert mock.call_args.kwargs["target_dir"] == sub
+        assert (sub / "pyproject.toml").read_text() == new_text
+        assert (target / "pyproject.toml").read_text() == self.ROOT
+        assert result.requirements_path == "sub/pyproject.toml"
+        assert result.files_changed == ["sub/pyproject.toml"]
+
+    def test_dep_file_outside_the_target_is_refused(self, tmp_path: Path) -> None:
+        from depfresh.exceptions import DepfreshError
+
+        target = self._tree(tmp_path)
+        (tmp_path / "other").mkdir()
+        (tmp_path / "other" / "pyproject.toml").write_text(self.SUB)
+        with pytest.raises(DepfreshError, match="outside"):
+            upgrade(target / "sub", dep_file="../../other/pyproject.toml", python="3.12")
+
+    def test_requirements_file_is_checked_against_its_own_pyproject(
+        self, tmp_path: Path,
+    ) -> None:
+        from depfresh.indexes import PrivateSourceError
+
+        target = self._tree(tmp_path)
+        (target / "sub" / "pyproject.toml").write_text(
+            self.SUB + '[[tool.uv.index]]\nname = "internal"\n'
+            'url = "https://us-east1-python.pkg.dev/acme/python/simple/"\n'
+            '[tool.uv.sources]\nprivate-widget = { index = "internal" }\n'
+        )
+        (target / "sub" / "requirements.txt").write_text("private-widget==0.1.0\n")
+        with (
+            patch.object(_upgrade_mod, "find_uv") as find_uv,
+            pytest.raises(PrivateSourceError, match="private-widget"),
+        ):
+            upgrade(target, dep_file="sub/requirements.txt", python="3.12")
+        assert not find_uv.called
+
+
 # ---------------------------------------------------------------------------
 # audit_only() — validation and happy path
 # ---------------------------------------------------------------------------

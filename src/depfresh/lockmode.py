@@ -64,6 +64,9 @@ _PYPI_HOSTS = {"pypi.org", "pypi.python.org", "files.pythonhosted.org"}
 
 #: Files a single (non-workspace) uv project needs to lock and export.
 _PROJECT_FILES = ("pyproject.toml", "uv.lock", "uv.toml", ".python-version")
+#: Files of the directories above a subproject that uv reads from there
+#: (settings, workspace discovery, the Python version request).
+_ANCESTOR_FILES = ("pyproject.toml", "uv.toml", ".python-version")
 
 _COPY_IGNORE = shutil.ignore_patterns(
     ".git", ".venv*", "venv*", "node_modules", "__pycache__", ".mypy_cache",
@@ -239,18 +242,41 @@ def _needs_full_copy(pyproject: dict[str, Any]) -> bool:
 
 
 class LockProject:
-    """A scratch copy of a uv project that uv commands run against."""
+    """A scratch copy of a uv project that uv commands run against.
 
-    def __init__(self, uv: str, target_dir: Path, work_dir: Path) -> None:
+    Args:
+        uv: The uv binary.
+        target_dir: The uv project (the directory of its pyproject.toml).
+        work_dir: Scratch directory.
+        context_dir: The directory depfresh was pointed at, when *target_dir*
+            is a subproject inside it.  The scratch copy is laid out like that
+            directory, with the uv settings, workspace roots and
+            ``.python-version`` files of every directory in between, so uv
+            reads the same configuration as it would in the real tree.
+    """
+
+    def __init__(self, uv: str, target_dir: Path, work_dir: Path,
+                 context_dir: Path | None = None) -> None:
         self.uv = uv
         self.target_dir = target_dir
-        self.root = work_dir / "project"
         self.commands: list[str] = []
         pyproject = tomllib.loads((target_dir / "pyproject.toml").read_text(encoding="utf-8"))
         full_copy = _needs_full_copy(pyproject)
         if full_copy:
             self._check_paths_inside(pyproject)
         check_static_project(target_dir)
+        base = work_dir / "project"
+        self.root = base
+        if context_dir is not None and target_dir.resolve() != context_dir.resolve():
+            context, project = context_dir.resolve(), target_dir.resolve()
+            relative = project.relative_to(context)
+            self.root = base / relative
+            for ancestor in [context, *(context / part for part in _prefixes(relative))]:
+                dest = base / ancestor.relative_to(context)
+                dest.mkdir(parents=True, exist_ok=True)
+                for name in _ANCESTOR_FILES:
+                    if (ancestor / name).is_file():
+                        shutil.copy2(ancestor / name, dest / name)
         if full_copy:
             shutil.copytree(target_dir, self.root, ignore=_COPY_IGNORE, symlinks=True)
         else:
@@ -352,6 +378,59 @@ def check_static_dependencies(
 #: What ``uv lock`` needs statically to avoid building a project: with a
 #: dynamic version it runs the build backend even for ``package = false``.
 _LOCK_STATIC_FIELDS = ("version", "dependencies", "optional-dependencies")
+
+
+def _prefixes(relative: Path) -> list[Path]:
+    """``a/b/c`` → ``[a, a/b]``: the directories between a context and a subproject."""
+    parts = relative.parts[:-1]
+    return [Path(*parts[: i + 1]) for i in range(len(parts))]
+
+
+def workspace_root_of(project_dir: Path) -> Path | None:
+    """The uv workspace that has *project_dir* as a member, if any.
+
+    Follows uv's own discovery: only the nearest ``pyproject.toml`` above the
+    project counts, and the project is a member when that file declares
+    ``[tool.uv.workspace]`` whose ``members`` match it and ``exclude`` does not.
+    """
+    project = project_dir.resolve()
+    for ancestor in project.parents:
+        pyproject = ancestor / "pyproject.toml"
+        if not pyproject.is_file():
+            continue
+        try:
+            data = tomllib.loads(pyproject.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError):
+            return None
+        workspace = data.get("tool", {}).get("uv", {}).get("workspace")
+        if not isinstance(workspace, dict):
+            return None
+
+        def matches(key: str, root: Path = ancestor, spec: dict[str, Any] = workspace) -> bool:
+            for pattern in spec.get(key, []) or []:
+                try:
+                    if any(m.resolve() == project for m in root.glob(str(pattern))):
+                        return True
+                except (ValueError, NotImplementedError):  # empty or absolute pattern
+                    continue
+            return False
+
+        return ancestor if matches("members") and not matches("exclude") else None
+    return None
+
+
+def check_not_workspace_member(project_dir: Path, manifest: Path) -> None:
+    """Refuse a workspace member: what ships is the workspace's lock, not the member's.
+
+    Raises:
+        DepfreshError: When *project_dir* is a member of a uv workspace.
+    """
+    root = workspace_root_of(project_dir)
+    if root is not None:
+        raise DepfreshError(
+            f"{manifest} belongs to the uv workspace at {root}, so uv resolves and locks it "
+            f"from {root / 'uv.lock'}; run depfresh on {root} instead"
+        )
 
 
 def check_static_project(project_dir: Path) -> None:
@@ -552,9 +631,14 @@ def remediate_lock(
     sources: AdvisorySources,
     venv_name: str,
     audit_only: bool = False,
+    context_dir: Path | None = None,
 ) -> LockOutcome:
-    """Audit and (unless *audit_only*) remediate the uv project in *target_dir*."""
-    project = LockProject(uv, target_dir, work_dir)
+    """Audit and (unless *audit_only*) remediate the uv project in *target_dir*.
+
+    *context_dir* is the directory the run was pointed at when *target_dir*
+    is a subproject inside it (see :class:`LockProject`).
+    """
+    project = LockProject(uv, target_dir, work_dir, context_dir)
     revision_before, locked_before = read_lock(project.lock_path)
     local = sorted(p.name for p in locked_before if p.kind in ("path", "editable", "directory"))
 

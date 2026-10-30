@@ -38,7 +38,12 @@ from depfresh.indexes import (
     foreign_sources,
     uv_source_indexes,
 )
-from depfresh.lockmode import LockOutcome, check_static_project, remediate_lock
+from depfresh.lockmode import (
+    LockOutcome,
+    check_not_workspace_member,
+    check_static_project,
+    remediate_lock,
+)
 from depfresh.models import DependencyScope, DependencySpec, UpgradeResult, Vulnerability
 from depfresh.parsers import (
     DependencyFormat,
@@ -660,6 +665,23 @@ class _Manifest:
             and (self.path.parent / "uv.lock").is_file()
         )
 
+    @property
+    def project_dir(self) -> Path:
+        """The project the run works on: where uv runs and what the import check scans.
+
+        The directory of a ``pyproject.toml`` or ``setup.py`` (a subproject
+        with ``--dep-file sub/pyproject.toml``); the target for requirements
+        files, whose includes resolve inside it.
+        """
+        if self.fmt in _REQUIREMENTS_FORMATS:
+            return self.target_dir
+        return self.path.parent
+
+    def relative(self, name: str) -> str:
+        """*name* in the project directory, as a path relative to the target."""
+        prefix = self.project_dir.resolve().relative_to(self.target_dir.resolve())
+        return (prefix / name).as_posix()
+
 
 def _resolve_manifest(target_dir: Path, dep_file: str | None, fmt: str | None) -> _Manifest:
     uv_flags: tuple[str, ...] | None = None
@@ -677,6 +699,11 @@ def _resolve_manifest(target_dir: Path, dep_file: str | None, fmt: str | None) -
         log.info("Auto-detected %s: %s", path.name, reason)
     if not path.exists():
         raise RequirementsNotFoundError(str(path))
+    if not path.resolve().is_relative_to(target_dir.resolve()):
+        raise DepfreshError(
+            f"--dep-file {dep_file} is outside {target_dir}; point depfresh at a directory "
+            "that contains it"
+        )
     if dep_file and path.name == "pyproject.toml" and (path.parent / "uv.lock").is_file():
         uv_flags = dockerfile_uv_sync_flags(path.parent)
         extras = extras_of_uv_flags(uv_flags or ())
@@ -770,8 +797,8 @@ def _lock_result(
         outcome.plans, outcome.final.pins, outcome.failures, outcome.post_vulns,
         applied=not (options.dry_run or audit_only_run),
     )
-    files = (["uv.lock"] if outcome.new_lock else []) + (
-        ["pyproject.toml"] if outcome.new_pyproject else []
+    files = ([manifest.relative("uv.lock")] if outcome.new_lock else []) + (
+        [manifest.relative("pyproject.toml")] if outcome.new_pyproject else []
     )
     gate = outcome.gate
     result = UpgradeResult(
@@ -779,7 +806,7 @@ def _lock_result(
         python_version=options.env.python_version,
         uv_version=uv_version,
         pip_audit_version=pip_audit_version,
-        requirements_path="uv.lock",
+        requirements_path=manifest.relative("uv.lock"),
         venv_name=venv_name,
         service_label=service_label,
         dependency_scope=dependency_scope,
@@ -880,13 +907,14 @@ def _run_lock_mode(
         auditor = _auditor(audit_python, work_dir, sources, repo_advisories)
         outcome = remediate_lock(
             uv=uv,
-            target_dir=manifest.target_dir,
+            target_dir=manifest.project_dir,
             work_dir=work_dir,
             auditor=auditor,
             options=options,
             sources=sources,
             venv_name=venv_name,
             audit_only=audit_only_run,
+            context_dir=manifest.target_dir,
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
@@ -906,7 +934,7 @@ def _run_lock_mode(
         log.info("DRY RUN — %s NOT modified", ", ".join(result.files_changed) or "nothing")
     elif result.files_changed:
         if outcome.new_lock is not None:
-            (manifest.target_dir / "uv.lock").write_bytes(outcome.new_lock)
+            (manifest.project_dir / "uv.lock").write_bytes(outcome.new_lock)
         if outcome.new_pyproject is not None:
             manifest.path.write_bytes(outcome.new_pyproject)
         result.dep_file_updated = True
@@ -1018,23 +1046,28 @@ def _validate_inputs(
     * ``pyproject.toml`` without a lock: ``name @ url`` requirements and
       names ``[tool.uv.sources]`` maps to a path, workspace, VCS or URL;
     * uv projects: every project uv would have to build to lock (see
-      :func:`depfresh.lockmode.check_static_project`).
+      :func:`depfresh.lockmode.check_static_project`);
+    * a ``pyproject.toml`` that is a uv workspace member: what ships is the
+      workspace's lock, so the run is refused and pointed at the root.
     """
     if manifest.fmt in _REQUIREMENTS_FORMATS:
         tree = inspect_tree(manifest.path, manifest.target_dir)
         if tree.direct and not ignore_direct_references:
             raise DirectReferenceError(str(manifest.path), tree.direct)
-        check_requirements_against_sources(tree.registry, manifest.target_dir, manifest.path.name)
+        for directory in dict.fromkeys((manifest.path.parent, manifest.target_dir)):
+            check_requirements_against_sources(tree.registry, directory, manifest.path.name)
     elif manifest.fmt == DependencyFormat.SETUP_PY:
         _select_dependencies(
             manifest.handler, manifest.path, dependency_scope=dependency_scope,
             ignore_direct_references=ignore_direct_references,
         )
         listed = set(manifest.handler.parse(manifest.path))
-        check_requirements_against_sources(listed, manifest.target_dir, manifest.path.name)
+        check_requirements_against_sources(listed, manifest.project_dir, manifest.path.name)
     elif manifest.is_uv_lock_project:
-        check_static_project(manifest.path.parent)
+        check_not_workspace_member(manifest.project_dir, manifest.path)
+        check_static_project(manifest.project_dir)
     elif manifest.fmt == DependencyFormat.PYPROJECT_PEP621:
+        check_not_workspace_member(manifest.project_dir, manifest.path)
         selected, _, _ = _select_dependencies(
             manifest.handler, manifest.path, dependency_scope=dependency_scope,
             ignore_direct_references=ignore_direct_references,
@@ -1103,7 +1136,7 @@ def _run_pip_mode(
         is_setup_py = manifest.fmt == DependencyFormat.SETUP_PY
         outcome = remediate_pip(
             uv=uv,
-            target_dir=manifest.target_dir,
+            target_dir=manifest.project_dir,
             manifest=_setup_py_manifest(manifest, work_dir, options) if is_setup_py
             else manifest.path,
             fmt=DependencyFormat.REQUIREMENTS_IN if is_setup_py else manifest.fmt,
