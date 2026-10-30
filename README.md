@@ -323,6 +323,10 @@ if result.pre_audit_vulns:
 - Poetry and Pipfile projects are supported only by `--strategy latest`, which resolves on the machine running depfresh.
 - Operates on a single dependency file per run; `-r`/`-c` includes are followed only inside the target directory, and workspace path dependencies only inside the project.
 - In lock-aware mode uv runs on a scratch copy of the project. User-level uv configuration and `UV_*` environment variables apply, and so do the settings of the directories between the target and the project, but not those of directories above the target: point depfresh at the directory that holds them.
+- When a re-audit finds an advisory the changes brought in, or the repository-advisory step leaves more database findings, depfresh withholds (or undoes) the whole step rather than finding the one co-upgrade responsible.
+- Modules a script imports by bare name from its own subdirectory (outside the project directory and `src/`) are not recognised as local; they show as failed imports before and after the upgrade, which never counts as a regression.
+- A requirements file cannot carry `[tool.uv.sources]`, so a private package that only arrives transitively through a requirements file resolves from the indexes the requirements file and uv's settings name, exactly as the build would.
+- `--repo-advisories` makes one `gh api` call per repository and per new advisory; a repository range that mixes bare versions and comparators (`1.9.0, <= 1.10.27`) is listed for checking by hand.
 
 <details>
 <summary><strong>Known edge cases</strong></summary>

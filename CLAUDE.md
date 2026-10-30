@@ -24,7 +24,7 @@ src/depfresh/          # Source code
   uv.py                # uv discovery (minimum version), venv management, subprocess helper
   audit.py             # Isolated, pinned pip-audit; alias dedupe
   verify.py            # AST-based import verification (no imports executed)
-  textio.py            # UTF-8/UTF-16 aware reading and writing
+  textio.py            # UTF-8/UTF-16 aware reading, line-ending-preserving atomic writes
   reports.py           # Log/markdown report generation
   exceptions.py        # Custom exceptions
 tests/                 # pytest test suite (mirrors src modules)
