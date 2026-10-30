@@ -739,10 +739,21 @@ def _md_checklist(md: list[str], report: UpgradeResult) -> None:
     remaining = len(report.post_audit_vulns)
     md.append("## Verification Checklist")
     md.append("")
-    md.append(f"- [x] `uv` environment created with Python {report.python_version}")
-    md.append(
-        f"- [x] All {report.original_count} original packages installed successfully"
-    )
+    if report.mode == "lock":
+        md.append(
+            f"- [x] Exported {report.original_count} shipped packages from `uv.lock` for "
+            f"`{report.platform}`, Python {report.python_version}"
+        )
+    elif report.mode in ("requirements", "pyproject"):
+        md.append(
+            f"- [x] Resolved {report.original_count} packages from `{report.requirements_path}` "
+            f"for `{report.platform}`, Python {report.python_version}"
+        )
+    else:
+        md.append(f"- [x] `uv` environment created with Python {report.python_version}")
+        md.append(
+            f"- [x] All {report.original_count} original packages installed successfully"
+        )
     md.append(
         f"- [x] Pre-upgrade audit: {len(report.pre_audit_vulns)} vulnerabilities identified"
     )

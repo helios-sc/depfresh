@@ -680,6 +680,11 @@ def remediate_pip(
     changed = new_text != original
     resolution_check = ""
     final = current
+    listed = doc.listed()
+    for name, spec in sorted(edits.items()):
+        ws.commands.append(f"# {ws.manifest_name}: {name} {listed.get(name) or '(any)'} -> {spec}")
+    for name, (spec, comment) in sorted(additions.items()):
+        ws.commands.append(f"# {ws.manifest_name}: add {name}{spec}  # {comment}")
     if changed:
         try:
             final = ws.compile(ws.write(new_text), record=True)
