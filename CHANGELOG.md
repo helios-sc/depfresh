@@ -28,7 +28,7 @@ The default remediation now audits and fixes what actually ships, and moves only
 - Advisories are deduplicated by alias (GHSA/PYSEC/CVE), so each is counted once.
 - Auto-detection prefers `pyproject.toml` when a `uv.lock` exists, then the manifest a local Dockerfile installs, before the old file order.
 - uv must be at least 0.9.0; older binaries on `PATH` are skipped (and named) instead of being used silently.
-- The import check locates modules (including namespace packages) without importing them, guards each module separately, compares against the pre-upgrade baseline, and blocks the write-back on regressions. Local modules are recognised at any depth.
+- The import check locates modules (including namespace packages) without importing them, guards each module separately, compares against the pre-upgrade baseline, and blocks the write-back on regressions. Local modules are the ones the project directory and `src/` expose: a nested `app/integrations/google/` no longer hides `google.cloud`, a local namespace directory only provides what it holds, and a bare name such as an `alembic/` migrations directory is checked against the venv. In resolved mode the remediated set is installed into a fresh venv instead of over the baseline.
 - `--strategy latest` (the 0.1 behaviour) edits requirement lines in place instead of writing a freeze, and reads floors as the installed versions, so a `>=2.10.0` floor is no longer "upgraded" down to 2.19.0.
 - All temporary venvs and files live in a work directory outside the target, removed even when installation fails.
 

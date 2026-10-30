@@ -11,6 +11,7 @@ import pytest
 
 from depfresh.models import ImportCheck
 from depfresh.verify import (
+    LocalModules,
     _batch_import_check,
     _extract_imports,
     _find_local_modules,
@@ -124,13 +125,37 @@ class TestFindLocalModules:
         assert "venv" not in local
         assert ".venv-test" not in local
 
-    def test_finds_modules_below_the_first_level(self, tmp_path: Path) -> None:
-        """A project that puts src/ on sys.path imports its modules by bare name."""
+    def test_src_is_an_import_root(self, tmp_path: Path) -> None:
+        """src/ layouts import their modules by bare name; deeper modules are not roots."""
         (tmp_path / "src" / "ops").mkdir(parents=True)
         (tmp_path / "src" / "db_client.py").write_text("")
         (tmp_path / "src" / "ops" / "geo_lookup.py").write_text("")
         local = _find_local_modules(tmp_path)
-        assert {"db_client", "geo_lookup", "src", "ops"} <= local
+        assert {"db_client", "src", "ops"} <= local
+        assert "geo_lookup" not in local
+
+    def test_a_nested_directory_never_hides_a_third_party_package(self, tmp_path: Path) -> None:
+        """app/integrations/google/ is app.integrations.google, not google."""
+        nested = tmp_path / "app" / "integrations" / "google"
+        nested.mkdir(parents=True)
+        for pkg in (tmp_path / "app", tmp_path / "app" / "integrations", nested):
+            (pkg / "__init__.py").write_text("")
+        (nested / "storage.py").write_text("")
+        local = LocalModules.of(tmp_path)
+        assert local.provides("app.integrations.google")
+        assert not local.provides("google.cloud.storage")
+
+    def test_a_local_namespace_merges_with_site_packages(self, tmp_path: Path) -> None:
+        """A local google/ without __init__.py only provides what it holds."""
+        (tmp_path / "google" / "helpers").mkdir(parents=True)
+        (tmp_path / "google" / "auth_local.py").write_text("")
+        local = LocalModules.of(tmp_path)
+        assert local.classify("google") == "either"
+        assert local.provides("google.auth_local")
+        assert local.provides("google.helpers.x")
+        assert not local.provides("google.cloud.storage")
+        (tmp_path / "google" / "__init__.py").write_text("")
+        assert LocalModules.of(tmp_path).provides("google.cloud.storage")  # a regular package
 
     def test_ignores_modules_inside_virtualenvs(self, tmp_path: Path) -> None:
         site = tmp_path / ".venv" / "lib" / "python3.11" / "site-packages" / "requests"
@@ -145,6 +170,30 @@ class TestFindLocalModules:
 
 
 class TestVerifyImports:
+    def test_a_migrations_directory_does_not_hide_the_package(self, tmp_path: Path) -> None:
+        """alembic/env.py imports the third-party alembic; app/ imports stay local."""
+        (tmp_path / "alembic").mkdir()
+        (tmp_path / "alembic" / "env.py").write_text("from alembic import op\n")
+        (tmp_path / "app").mkdir()
+        (tmp_path / "app" / "main.py").write_text("from app import settings\nimport stripe\n")
+        (tmp_path / "app" / "settings.py").write_text("")
+        (tmp_path / "app" / "integrations" / "google").mkdir(parents=True)
+        (tmp_path / "app" / "integrations" / "google" / "sheets.py").write_text(
+            "from google.cloud import storage\n"
+        )
+        located = {"alembic": None, "stripe": None, "google.cloud": None,
+                   "app": "No module named 'app'"}
+        with (
+            patch("depfresh.verify._get_stdlib_modules", return_value=set()),
+            patch("depfresh.verify._batch_import_check",
+                  side_effect=lambda py, mods: ({m: located[m] for m in mods}, {})) as check,
+        ):
+            result = verify_imports(tmp_path, "/venv/bin/python")
+        assert check.call_args.args[1] == {"alembic", "app", "stripe", "google.cloud"}
+        assert result.verified == ["alembic", "google.cloud", "stripe"]
+        assert result.failed == {}
+        assert "app" in result.skipped_local
+
     def test_returns_verified_and_failed_third_party_imports(self, tmp_path: Path) -> None:
         (tmp_path / "app.py").write_text("import flask\nimport requests\nimport os\n")
 

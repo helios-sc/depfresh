@@ -28,7 +28,6 @@ from __future__ import annotations
 
 import logging
 import re
-import sys
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -891,7 +890,10 @@ def remediate_pip(
         except CommandError as exc:
             resolution_check = f"failed: {_first_line(exc.stderr)}"
     if changed and gate.enabled and gate.baseline is not None and venv_python:
-        _install_for_imports(ws, venv, ws.write(new_text), gate, baseline=False)
+        # A fresh venv: installing over the baseline would keep packages the
+        # new set no longer installs, and hide the imports that need them.
+        _install_for_imports(ws, venv.with_name(f"{venv.name}-after"), ws.write(new_text), gate,
+                             baseline=False)
 
     return PipOutcome(
         baseline=baseline, final=final, pre_vulns=pre_vulns, post_vulns=current_vulns,
@@ -1105,13 +1107,9 @@ def _with_cobumps(
 def _install_for_imports(
     ws: PipWorkspace, venv: Path, manifest: Path, gate: ImportGate, *, baseline: bool,
 ) -> str | None:
-    """Install *manifest* on this host into *venv* and run the import check."""
+    """Install *manifest* on this host into a new venv at *venv* and run the import check."""
     try:
-        if baseline:
-            python = create_venv(ws.uv, venv, ws.options.env.python_version)
-        else:
-            bin_dir = "Scripts" if sys.platform == "win32" else "bin"
-            python = str(venv / bin_dir / ("python.exe" if sys.platform == "win32" else "python"))
+        python = create_venv(ws.uv, venv, ws.options.env.python_version)
         args = [ws.uv, "pip", "install", "-r", str(manifest), "--python", python]
         if ws.fmt == DependencyFormat.PYPROJECT_PEP621:
             if ws.options.all_extras:

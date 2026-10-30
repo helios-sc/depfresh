@@ -411,6 +411,81 @@ class TestNonPyPIIndexes:
         ]
 
 
+class TestRunPipModeEndToEnd:
+    """upgrade() on a requirements file: the real resolved-mode run, with fake tools.
+
+    uv's resolver, uv's installs, pip-audit and the module locator are faked;
+    everything between them (planning, edits, the import gate, the result and
+    the write-back) is depfresh's own code.
+    """
+
+    UNIVERSE = {"urllib3": ["2.6.3", "2.8.0"], "six": ["1.17.0"]}
+
+    def _upgrade(self, tmp_path: Path, raw: bytes, after_failure: bool) -> tuple[Any, list[Path]]:
+        from depfresh.models import ImportCheck
+        from depfresh.upgrade import upgrade
+
+        upgrade_mod = sys.modules["depfresh.upgrade"]
+        target = tmp_path / "proj"
+        target.mkdir()
+        (target / "requirements.txt").write_bytes(raw)
+        (target / "app.py").write_text("import urllib3.contrib.socks\nimport six\n")
+        venvs: list[Path] = []
+
+        def fake_venv(uv: str, path: Path, python: str) -> str:
+            venvs.append(path)
+            return str(path / "bin" / "python")
+
+        def fake_audit(tool: str, path: Path, label: str) -> list[Vulnerability]:
+            pins = dict(line.split("==") for line in path.read_text().split())
+            if pins.get("urllib3") == "2.6.3":
+                return [Vulnerability("urllib3", "2.6.3", "GHSA-urllib3", "2.8.0", "")]
+            return []
+
+        def fake_verify(target_dir: Path, python: str, *, label: str) -> ImportCheck:
+            gone = after_failure and label == "upgraded"
+            return ImportCheck(
+                verified=["six"] if gone else ["six", "urllib3.contrib.socks"],
+                failed={"urllib3.contrib.socks": "No module named 'urllib3.contrib.socks'"}
+                if gone else {},
+            )
+
+        with (
+            patch.object(upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(upgrade_mod, "get_uv_version", return_value="0.13.6"),
+            patch.object(upgrade_mod, "install_pip_audit",
+                         return_value=("/tool/bin/python", "2.10.1")),
+            patch.object(PipWorkspace, "compile", autospec=True,
+                         side_effect=FakeResolver(self.UNIVERSE, {})),
+            patch("depfresh.pipmode.create_venv", side_effect=fake_venv),
+            patch("depfresh.pipmode.run"),
+            patch("depfresh.remediation.run_audit", side_effect=fake_audit),
+            patch("depfresh.remediation.verify_imports", side_effect=fake_verify),
+        ):
+            result = upgrade(target, python="3.11", reports_dir=tmp_path / "reports",
+                             sources=FakeSources({"urllib3": "2.8.0"}, self.UNIVERSE))
+        return result, venvs
+
+    def test_an_import_regression_blocks_the_write_back(self, tmp_path: Path) -> None:
+        raw = b"urllib3==2.6.3\nsix==1.17.0\n"
+        result, venvs = self._upgrade(tmp_path, raw, after_failure=True)
+        assert result.import_regressions == {
+            "urllib3.contrib.socks": "No module named 'urllib3.contrib.socks'",
+        }
+        assert (tmp_path / "proj" / "requirements.txt").read_bytes() == raw
+        assert result.dep_file_updated is False
+        assert len(venvs) == 2 and venvs[0] != venvs[1], "the after set needs a fresh venv"
+
+    def test_utf16_requirements_are_written_back_in_utf16(self, tmp_path: Path) -> None:
+        raw = "urllib3==2.6.3\r\nsix==1.17.0\r\n".encode("utf-16")
+        result, _ = self._upgrade(tmp_path, raw, after_failure=False)
+        written = (tmp_path / "proj" / "requirements.txt").read_bytes()
+        assert result.dep_file_updated is True
+        assert written[:2] in (b"\xff\xfe", b"\xfe\xff")
+        assert written.decode("utf-16") == "urllib3==2.8.0\r\nsix==1.17.0\r\n"
+        assert result.post_audit_vulns == []
+
+
 class TestRepositoryAdvisories:
     UNIVERSE = {"aiohttp": ["3.14.1", "3.14.4"], "yarl": ["1.24.2", "1.25.1"],
                 "six": ["1.17.0", "1.17.1"]}

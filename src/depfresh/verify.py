@@ -29,6 +29,7 @@ import subprocess
 import tempfile
 import textwrap
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from depfresh.models import ImportCheck
@@ -61,20 +62,24 @@ def verify_imports(target_dir: Path, venv_python: str, *, label: str = "upgraded
     log.info("Scanned %d Python files, found %d unique imports", files_scanned, len(all_imports))
 
     # 2. Identify local and stdlib modules
-    local_modules = _find_local_modules(target_dir)
+    local_modules = LocalModules.of(target_dir)
     stdlib_modules = _get_stdlib_modules(venv_python)
 
     # 3. Classify imports
     local_skipped: set[str] = set()
     third_party: set[str] = set()
+    either: set[str] = set()   # a bare name of a local namespace directory
     for imp in all_imports:
         top = imp.split(".")[0]
-        if top in local_modules:
+        where = local_modules.classify(imp)
+        if where == "local":
             local_skipped.add(top)
         elif top in stdlib_modules:
             pass
         else:
             third_party.add(imp)
+            if where == "either":
+                either.add(imp)
 
     log.info(
         "Third-party: %d, local: %d, stdlib: %d",
@@ -92,6 +97,11 @@ def verify_imports(target_dir: Path, venv_python: str, *, label: str = "upgraded
 
     # 4. Batch import check in the venv
     results, warns = _batch_import_check(venv_python, third_party)
+    for mod in sorted(either):
+        # Not in the venv either: the local namespace directory is what it imports.
+        if results.get(mod) is not None:
+            del results[mod]
+            local_skipped.add(mod.split(".")[0])
 
     verified = sorted(mod for mod, err in results.items() if err is None)
     failed = {mod: err for mod, err in sorted(results.items()) if err is not None}
@@ -148,27 +158,73 @@ def _extract_imports(target_dir: Path) -> tuple[set[str], int]:
     return imports, files_scanned
 
 
-def _find_local_modules(target_dir: Path) -> set[str]:
-    """Identify local package/module names in *target_dir* (not third-party).
+@dataclass
+class LocalModules:
+    """The project's own top-level modules, as its import roots expose them.
 
-    Projects often put directories such as ``src/`` on ``sys.path`` at
-    runtime, so a module anywhere in the tree can be imported by its bare
-    name.  Every ``.py`` file stem and every directory holding Python files
-    counts as local, at any depth (virtual environments and caches excluded).
+    The import roots are the project directory and ``src/``: only what sits
+    directly in one of them is importable by a bare name.  A module deeper in
+    the tree (``app/integrations/google/``) is ``app.integrations.google`` and
+    never hides a third-party ``google``.
+
+    Attributes:
+        regular: ``.py`` modules and packages with an ``__init__.py`` at a root,
+            and the project directory's own name.
+        namespaces: Directories without ``__init__.py`` at a root.  Python merges
+            such a namespace with same-named ones in site-packages, and a
+            regular package there wins over it, so ``google.cloud`` stays
+            third-party when the local ``google/`` has no ``cloud``, and a bare
+            ``alembic`` next to an ``alembic/`` migrations directory may well be
+            the third-party package.
     """
-    local: set[str] = {target_dir.name}
-    for py_file in target_dir.rglob("*.py"):
-        rel_parts = py_file.relative_to(target_dir).parts
-        if any(_is_skipped_dir(part) for part in rel_parts[:-1]):
-            continue
-        local.add(py_file.stem)
-        local.update(rel_parts[:-1])
-    for item in target_dir.iterdir():
-        # Top-level directories (even without .py files yet) are local namespaces.
-        if item.is_dir() and not _is_skipped_dir(item.name):
-            local.add(item.name)
-    local.discard("__init__")
-    return local
+
+    regular: set[str] = field(default_factory=set)
+    namespaces: dict[str, list[Path]] = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, target_dir: Path) -> LocalModules:
+        found = cls(regular={target_dir.name})
+        roots = [target_dir, *([target_dir / "src"] if (target_dir / "src").is_dir() else [])]
+        for root in roots:
+            for item in sorted(root.iterdir()):
+                if item.is_file() and item.suffix == ".py" and item.stem != "__init__":
+                    found.regular.add(item.stem)
+                elif item.is_dir() and not _is_skipped_dir(item.name):
+                    if (item / "__init__.py").is_file():
+                        found.regular.add(item.name)
+                    else:
+                        found.namespaces.setdefault(item.name, []).append(item)
+        return found
+
+    def classify(self, module: str) -> str:
+        """``"local"``, ``"other"`` (stdlib or third-party), or ``"either"``.
+
+        ``"either"`` is the bare name of a local namespace directory: the venv
+        decides (a third-party package of that name wins; otherwise it is local).
+        """
+        parts = module.split(".")
+        if parts[0] in self.regular:
+            return "local"
+        if parts[0] not in self.namespaces:
+            return "other"
+        if len(parts) == 1:
+            return "either"
+        if any((d / parts[1]).is_dir() or (d / f"{parts[1]}.py").is_file()
+               for d in self.namespaces[parts[0]]):
+            return "local"
+        return "other"
+
+    def provides(self, module: str) -> bool:
+        """True when *module* certainly resolves to the project's own code."""
+        return self.classify(module) == "local"
+
+    def names(self) -> set[str]:
+        return self.regular | set(self.namespaces)
+
+
+def _find_local_modules(target_dir: Path) -> set[str]:
+    """Top-level names the project's import roots provide (see :class:`LocalModules`)."""
+    return LocalModules.of(target_dir).names()
 
 
 def _is_skipped_dir(name: str) -> bool:
