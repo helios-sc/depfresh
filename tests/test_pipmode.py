@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import itertools
+import sys
 from pathlib import Path
 from textwrap import dedent
 from typing import Any
@@ -29,6 +30,11 @@ from depfresh.pipmode import (
     strip_pyproject_direct_refs,
 )
 from depfresh.remediation import RemediationOptions
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib
 
 ENV = TargetEnv("3.11")
 
@@ -197,16 +203,12 @@ class TestPyprojectDocument:
         doc.append("urllib3>=2.8.0  # depfresh: GHSA-8988-9cw3-xx77")
         out = doc.render()
         assert '"urllib3>=2.8.0", # depfresh: GHSA-8988-9cw3-xx77' in out
-        import tomllib
-
         deps = tomllib.loads(out)["project"]["dependencies"]
         assert deps == ["pandas", "pypdf>=6.21,<7", "urllib3>=2.8.0"]
 
     def test_appends_into_an_extra(self) -> None:
         doc = PyprojectDocument(self.TEXT, ["gcs"], False)
         doc.append("protobuf>=6.33.5  # depfresh: GHSA-x", extra="gcs")
-        import tomllib
-
         data = tomllib.loads(doc.render())
         assert data["project"]["optional-dependencies"]["gcs"] == [
             "google-cloud-storage>=2.0", "protobuf>=6.33.5",
@@ -478,8 +480,6 @@ class TestIgnoredDirectReferences:
             [project.optional-dependencies]
             extra = ["other @ git+https://example.com/other.git", "six"]
         """)
-        import tomllib
-
         data = tomllib.loads(strip_pyproject_direct_refs(text))
         assert data["project"]["dependencies"] == ["flask>=2.3.0"]
         assert data["project"]["optional-dependencies"]["extra"] == ["six"]

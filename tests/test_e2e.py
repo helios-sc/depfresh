@@ -125,7 +125,10 @@ def iter_requirements(req_path: Path, extras: list[str] | None = None,
                       all_extras: bool = False) -> list[tuple[str, str]]:
     requirements: list[tuple[str, str]] = []
     if req_path.name == "pyproject.toml":
-        import tomllib
+        try:
+            import tomllib
+        except ImportError:  # Python 3.10
+            import tomli as tomllib
 
         project = tomllib.loads(req_path.read_text()).get("project", {})
         lines = list(project.get("dependencies", []))
