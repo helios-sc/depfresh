@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from depfresh.models import ImportCheck, PackageChange, Vulnerability
+from depfresh.models import ImportCheck, PackageChange, UpgradeResult, Vulnerability
 from depfresh.reports import write_log, write_markdown
 from tests.helpers import make_result as _make_report
 
@@ -113,3 +113,30 @@ class TestWriteMarkdown:
         content = path.read_text()
         assert "Reason" in content
         assert "major upgrade" in content.lower()
+
+
+class TestImportRegressionReporting:
+    def _report(self) -> UpgradeResult:
+        return _make_report(
+            import_check_baseline=ImportCheck(verified=["fastmcp", "fastmcp.tools.tool"]),
+            import_check=ImportCheck(
+                verified=["fastmcp"],
+                failed={"fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'"},
+            ),
+            import_regressions={"fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'"},
+            write_back_skipped="1 import(s) resolved before the upgrade and fail after it",
+        )
+
+    def test_markdown_lists_regressions_and_unwritten_file(self, tmp_path: Path) -> None:
+        report = self._report()
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "Regressions (1)" in content
+        assert "`fastmcp.tools.tool`" in content
+        assert "- [ ] Dependency file updated: no (1 import(s)" in content
+        assert "- [ ] Import verification: **1 regressions**" in content
+
+    def test_log_lists_regressions(self, tmp_path: Path) -> None:
+        report = self._report()
+        content = write_log(report, tmp_path, "2026-01-15").read_text()
+        assert "REGRESSIONS (1)" in content
+        assert "Import regressions: 1" in content

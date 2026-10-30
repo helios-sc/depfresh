@@ -98,6 +98,12 @@ class UpgradeResult:
     dry_run: bool = False
     dep_file_updated: bool = False
     import_check: ImportCheck | None = None
+    import_check_baseline: ImportCheck | None = None
+    #: Modules that resolved before the upgrade and fail after it.  When
+    #: non-empty the dependency file is not written and the CLI exits 3.
+    import_regressions: dict[str, str] = field(default_factory=dict)
+    #: Why the write-back was withheld (empty when it ran or on a dry run).
+    write_back_skipped: str = ""
 
     pre_audit_vulns: list[Vulnerability] = field(default_factory=list)
     post_audit_vulns: list[Vulnerability] = field(default_factory=list)

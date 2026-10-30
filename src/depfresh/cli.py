@@ -33,6 +33,12 @@ def main(argv: list[str] | None = None) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
+            exit codes:
+              0  no known vulnerabilities remain
+              1  error (nothing written)
+              2  vulnerabilities remain
+              3  imports that resolved before the upgrade fail after it (nothing written)
+
             examples:
               depfresh /path/to/project
               depfresh /path/to/project --label my_service
@@ -161,6 +167,15 @@ def main(argv: list[str] | None = None) -> None:
     if result.markdown_path:
         print(f"  Report:       {result.markdown_path}")
 
+    if result.import_regressions:
+        print(
+            f"\n  ERROR: {len(result.import_regressions)} import(s) resolved before the "
+            "upgrade and fail after it:"
+        )
+        for mod, err in result.import_regressions.items():
+            print(f"    {mod}: {err}")
+        print("  The dependency file was not written.")
+        sys.exit(3)
     if result.post_audit_vulns:
         print(f"\n  WARNING: {len(result.post_audit_vulns)} vulnerabilities remain.")
         sys.exit(2)

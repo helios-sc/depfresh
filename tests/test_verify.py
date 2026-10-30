@@ -2,10 +2,45 @@
 
 from __future__ import annotations
 
+import sys
+import venv
 from pathlib import Path
 from unittest.mock import patch
 
-from depfresh.verify import _extract_imports, _find_local_modules, verify_imports
+import pytest
+
+from depfresh.models import ImportCheck
+from depfresh.verify import (
+    _batch_import_check,
+    _extract_imports,
+    _find_local_modules,
+    import_regressions,
+    verify_imports,
+)
+
+
+@pytest.fixture(scope="module")
+def probe_venv(tmp_path_factory: pytest.TempPathFactory) -> tuple[str, Path]:
+    """A pip-less venv with a package whose import has a visible side effect.
+
+    Returns ``(venv_python, marker_file)``.  ``sidefx`` writes *marker_file*
+    when imported, so a check that imports anything is caught.
+    """
+    root = tmp_path_factory.mktemp("probe-venv")
+    venv.create(root / "venv", with_pip=False, symlinks=sys.platform != "win32")
+    bin_dir = "Scripts" if sys.platform == "win32" else "bin"
+    python = root / "venv" / bin_dir / ("python.exe" if sys.platform == "win32" else "python")
+    site = next((root / "venv").glob("lib/python*/site-packages"), None)
+    if site is None:
+        site = root / "venv" / "Lib" / "site-packages"
+    marker = root / "imported.marker"
+    pkg = site / "sidefx"
+    (pkg / "tools").mkdir(parents=True)
+    (pkg / "__init__.py").write_text(f"open({str(marker)!r}, 'w').write('imported')\n")
+    (pkg / "tools" / "__init__.py").write_text("")
+    (pkg / "tools" / "tool.py").write_text("raise RuntimeError('must not run')\n")
+    (site / "flatmod.py").write_text("")
+    return str(python), marker
 
 
 class TestExtractImports:
@@ -84,6 +119,25 @@ class TestFindLocalModules:
         assert "venv" not in local
         assert ".venv-test" not in local
 
+    def test_finds_modules_below_the_first_level(self, tmp_path: Path) -> None:
+        """A project that puts src/ on sys.path imports its modules by bare name."""
+        (tmp_path / "src" / "ops").mkdir(parents=True)
+        (tmp_path / "src" / "bq_client.py").write_text("")
+        (tmp_path / "src" / "ops" / "commodity_geo_map.py").write_text("")
+        local = _find_local_modules(tmp_path)
+        assert {"bq_client", "commodity_geo_map", "src", "ops"} <= local
+
+    def test_ignores_modules_inside_virtualenvs(self, tmp_path: Path) -> None:
+        site = tmp_path / ".venv" / "lib" / "python3.11" / "site-packages" / "requests"
+        site.mkdir(parents=True)
+        (site / "__init__.py").write_text("")
+        vendored = tmp_path / "env" / "lib" / "site-packages" / "flask"
+        vendored.mkdir(parents=True)
+        (vendored / "__init__.py").write_text("")
+        local = _find_local_modules(tmp_path)
+        assert "requests" not in local
+        assert "flask" not in local
+
 
 class TestVerifyImports:
     def test_returns_verified_and_failed_third_party_imports(self, tmp_path: Path) -> None:
@@ -115,3 +169,54 @@ class TestVerifyImports:
         assert result.verified == []
         assert result.failed == {}
         assert "helpers" in result.skipped_local
+
+
+class TestBatchImportCheck:
+    def test_missing_parent_fails_only_its_own_modules(self) -> None:
+        """A dotted import of a missing package must not crash the whole batch."""
+        results, _ = _batch_import_check(
+            sys.executable, {"json", "json.decoder", "definitely_missing_pkg_xyz.sub"},
+        )
+        assert results["json"] is None
+        assert results["json.decoder"] is None
+        assert "definitely_missing_pkg_xyz" in str(results["definitely_missing_pkg_xyz.sub"])
+
+    def test_missing_submodule_is_reported(self) -> None:
+        results, _ = _batch_import_check(sys.executable, {"json.no_such_submodule"})
+        assert "json.no_such_submodule" in str(results["json.no_such_submodule"])
+
+    def test_resolves_dotted_names_without_importing(
+        self, probe_venv: tuple[str, Path],
+    ) -> None:
+        python, marker = probe_venv
+        results, warns = _batch_import_check(
+            python, {"sidefx", "sidefx.tools.tool", "sidefx.tools.gone", "flatmod.sub"},
+        )
+        assert results["sidefx"] is None
+        assert results["sidefx.tools.tool"] is None
+        assert "sidefx.tools.gone" in str(results["sidefx.tools.gone"])
+        assert "not a package" in str(results["flatmod.sub"])
+        assert warns == {}
+        assert not marker.exists(), "the check imported sidefx/__init__.py"
+
+
+class TestImportRegressions:
+    def test_reports_only_modules_that_resolved_before(self) -> None:
+        baseline = ImportCheck(
+            verified=["fastmcp", "fastmcp.tools.tool"],
+            failed={"pytest": "No module named 'pytest'"},
+        )
+        after = ImportCheck(
+            verified=["fastmcp"],
+            failed={
+                "fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'",
+                "pytest": "No module named 'pytest'",
+            },
+        )
+        assert import_regressions(baseline, after) == {
+            "fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'",
+        }
+
+    def test_no_regressions_when_nothing_breaks(self) -> None:
+        check = ImportCheck(verified=["flask"])
+        assert import_regressions(check, check) == {}

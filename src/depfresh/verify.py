@@ -1,4 +1,17 @@
-"""AST-based import verification against the upgraded environment."""
+"""AST-based import verification against the upgraded environment.
+
+Imports are read from the project's ``.py`` files with :mod:`ast` (no project
+code runs) and then *located* — not imported — in the target venv: the
+top-level name with :func:`importlib.util.find_spec`, each submodule with
+:class:`importlib.machinery.PathFinder` inside its parent's search path.  No
+third-party module code runs either, and one missing module cannot abort the
+check for the others.
+
+Because a project usually has some imports that never resolve (test-only
+tools, optional extras, modules put on ``sys.path`` at runtime), the result is
+only meaningful relative to a baseline: :func:`import_regressions` reports the
+modules that resolved before the upgrade and fail after it.
+"""
 
 from __future__ import annotations
 
@@ -16,18 +29,24 @@ log = logging.getLogger("depfresh")
 
 _SKIP_DIRS = {
     "__pycache__", ".git", ".tox", ".mypy_cache", ".pytest_cache", "node_modules",
+    "site-packages", "dist-packages",
 }
 
 
-def verify_imports(target_dir: Path, venv_python: str) -> ImportCheck:
-    """Verify that third-party imports from the codebase resolve in the upgraded venv.
+def verify_imports(target_dir: Path, venv_python: str, *, label: str = "upgraded") -> ImportCheck:
+    """Verify that third-party imports from the codebase resolve in a venv.
 
     Scans all ``.py`` files under *target_dir*, classifies imports into
     stdlib / local / third-party, then checks that every third-party import
-    is resolvable in the venv without actually importing it (safe for
-    packages with side-effects or missing configs).
+    is resolvable in the venv without importing it (safe for packages with
+    side effects or missing configuration).
+
+    Args:
+        target_dir: Project directory to scan.
+        venv_python: Interpreter of the environment to check against.
+        label: Which environment this is, for logging (``"baseline"``…).
     """
-    log.info("Verifying imports against upgraded environment")
+    log.info("Verifying imports against the %s environment", label)
 
     # 1. Extract imports from Python files
     all_imports, files_scanned = _extract_imports(target_dir)
@@ -99,7 +118,7 @@ def _extract_imports(target_dir: Path) -> tuple[set[str], int]:
     files_scanned = 0
     for py_file in target_dir.rglob("*.py"):
         rel_parts = py_file.relative_to(target_dir).parts
-        if any(p in _SKIP_DIRS or p.startswith((".venv", "venv")) for p in rel_parts):
+        if any(_is_skipped_dir(p) for p in rel_parts[:-1]):
             continue
         try:
             with warnings.catch_warnings():
@@ -122,20 +141,50 @@ def _extract_imports(target_dir: Path) -> tuple[set[str], int]:
 
 
 def _find_local_modules(target_dir: Path) -> set[str]:
-    """Identify local package/module names in *target_dir* (not third-party)."""
-    local: set[str] = set()
-    local.add(target_dir.name)
-    for item in target_dir.iterdir():
-        if item.name.startswith("."):
+    """Identify local package/module names in *target_dir* (not third-party).
+
+    Projects often put directories such as ``src/`` on ``sys.path`` at
+    runtime, so a module anywhere in the tree can be imported by its bare
+    name.  Every ``.py`` file stem and every directory holding Python files
+    counts as local, at any depth (virtual environments and caches excluded).
+    """
+    local: set[str] = {target_dir.name}
+    for py_file in target_dir.rglob("*.py"):
+        rel_parts = py_file.relative_to(target_dir).parts
+        if any(_is_skipped_dir(part) for part in rel_parts[:-1]):
             continue
-        if item.is_dir() and not item.name.startswith(("venv", ".venv")):
+        local.add(py_file.stem)
+        local.update(rel_parts[:-1])
+    for item in target_dir.iterdir():
+        # Top-level directories (even without .py files yet) are local namespaces.
+        if item.is_dir() and not _is_skipped_dir(item.name):
             local.add(item.name)
-            for sub in item.iterdir():
-                if sub.is_dir() and not sub.name.startswith((".", "_")):
-                    local.add(sub.name)
-        elif item.is_file() and item.suffix == ".py":
-            local.add(item.stem)
+    local.discard("__init__")
     return local
+
+
+def _is_skipped_dir(name: str) -> bool:
+    """Return True for directories that never hold project modules."""
+    return (
+        name in _SKIP_DIRS
+        or name.startswith((".", "venv"))
+    )
+
+
+def import_regressions(baseline: ImportCheck, after: ImportCheck) -> dict[str, str]:
+    """Return the modules that resolved in *baseline* but fail in *after*.
+
+    Args:
+        baseline: Import check against the environment before the upgrade.
+        after: Import check against the upgraded environment.
+
+    Returns:
+        ``{module: error}`` for every regression, sorted by module name.
+    """
+    resolved_before = set(baseline.verified)
+    return {
+        mod: err for mod, err in sorted(after.failed.items()) if mod in resolved_before
+    }
 
 
 def _get_stdlib_modules(venv_python: str) -> set[str]:
@@ -153,68 +202,58 @@ def _get_stdlib_modules(venv_python: str) -> set[str]:
 def _batch_import_check(
     venv_python: str, modules: set[str],
 ) -> tuple[dict[str, str | None], dict[str, list[str]]]:
-    """Verify that third-party modules are available in the venv.
+    """Check that third-party modules can be located in the venv.
 
-    Uses ``importlib.metadata.packages_distributions()`` (Python 3.11+) to
-    check package availability without actually importing — avoids crashes
-    from missing configs, C-extension segfaults, or side-effects during
-    import.  Falls back to ``importlib.import_module()`` only for modules
-    not found in the metadata map.
+    Each module is resolved on its own, inside its own ``try``: the top-level
+    name with :func:`importlib.util.find_spec`, which searches ``sys.path``
+    without importing anything, then each dotted part with
+    :class:`importlib.machinery.PathFinder` in the parent's
+    ``submodule_search_locations``.  Unlike ``find_spec("pkg.sub")``, that never
+    imports ``pkg`` (no module code runs) and a missing ``pkg`` fails only
+    ``pkg.sub`` instead of the whole batch.
 
     Returns ``(results, warnings)`` where:
       - results: ``{module: error_string_or_None}``
-      - warnings: ``{module: [warning_messages]}``
+      - warnings: ``{module: [warning_messages]}`` (always empty: nothing is
+        imported, so no import-time warnings are raised)
     """
     if not modules:
         return {}, {}
 
     check_script = textwrap.dedent("""\
-        import sys, json, importlib, importlib.metadata, importlib.util, warnings
+        import importlib.machinery
+        import importlib.util
+        import json
+        import sys
 
-        modules = json.loads(sys.argv[1])
-
-        # Map of importable top-level names -> distribution packages (safe, no side-effects)
-        try:
-            pkg_map = importlib.metadata.packages_distributions()
-        except AttributeError:
-            pkg_map = {}  # Python < 3.11 fallback
+        def locate(mod):
+            parts = mod.split(".")
+            spec = importlib.util.find_spec(parts[0])
+            if spec is None:
+                return f"No module named '{parts[0]}'"
+            name = parts[0]
+            for part in parts[1:]:
+                locations = spec.submodule_search_locations
+                if locations is None:
+                    return f"'{name}' is not a package, so '{mod}' cannot be imported"
+                name = f"{name}.{part}"
+                spec = importlib.machinery.PathFinder.find_spec(name, list(locations))
+                if spec is None:
+                    return f"No module named '{name}'"
+            return None
 
         results = {}
-        warns = {}
-        for mod in modules:
-            top = mod.split(".")[0]
-            if "." in mod:
-                spec = importlib.util.find_spec(mod)
-                if spec is not None:
-                    results[mod] = None
-                    continue
+        for mod in json.loads(sys.argv[1]):
+            try:
+                results[mod] = locate(mod)
+            except Exception as exc:  # one broken module must not stop the batch
+                results[mod] = f"{type(exc).__name__}: {exc}"
 
-            if top in pkg_map and mod == top:
-                results[mod] = None
-                continue
-
-            # Fallback: actual import for packages not in metadata map
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                try:
-                    importlib.import_module(mod)
-                    results[mod] = None
-                except ImportError as e:
-                    results[mod] = str(e)
-                except Exception as e:
-                    results[mod] = f"{type(e).__name__}: {e}"
-            if caught:
-                warns[mod] = [
-                    f"{w.category.__name__}: {w.message}"
-                    for w in caught
-                    if issubclass(w.category, DeprecationWarning)
-                ]
-
-        print(json.dumps({"results": results, "warnings": warns}))
+        print(json.dumps({"results": results, "warnings": {}}))
     """)
 
     result = subprocess.run(
-        [venv_python, "-c", check_script, json.dumps(sorted(modules))],
+        [venv_python, "-I", "-c", check_script, json.dumps(sorted(modules))],
         capture_output=True, text=True, timeout=120,
     )
 

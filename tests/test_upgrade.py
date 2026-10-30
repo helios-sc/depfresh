@@ -328,6 +328,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
             patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
             patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "verify_imports", return_value=ImportCheck()),
             patch.object(_upgrade_mod, "install_packages", side_effect=error),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
@@ -429,6 +430,60 @@ class TestUpgradeHappyPath:
         install_deps = setup_mock.call_args.args[5]
         assert [dep.name for dep in install_deps] == ["flask"]
         assert result.direct_references_ignored == ["demo @ https://example.com/demo-1.0.tar.gz"]
+
+
+class TestImportRegressionGate:
+    """The write-back must not run when imports regress against the baseline."""
+
+    @staticmethod
+    def _run(tmp_path: Path, checks: list[ImportCheck], dry_run: bool = False) -> UpgradeResult:
+        setup_mock = _make_setup_venv_mock(tmp_path, old_pkgs={"fastmcp": "3.4.7"})
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.9.0"),
+            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
+            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
+            patch.object(_upgrade_mod, "build_constraints", return_value=[]),
+            patch.object(_upgrade_mod, "install_packages"),
+            patch.object(_upgrade_mod, "freeze", return_value={"fastmcp": "4.1.4"}),
+            patch.object(_upgrade_mod, "verify_imports", side_effect=checks),
+            patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
+            patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
+        ):
+            return upgrade(
+                tmp_path, label="test", reports_dir=tmp_path, dry_run=dry_run,
+                allow_major=[],
+            )
+
+    def test_regression_blocks_write_back(self, tmp_path: Path) -> None:
+        req = tmp_path / "requirements.txt"
+        req.write_text("fastmcp==3.4.7\n")
+        baseline = ImportCheck(verified=["fastmcp", "fastmcp.tools.tool"])
+        after = ImportCheck(
+            verified=["fastmcp"],
+            failed={"fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'"},
+        )
+        result = self._run(tmp_path, [baseline, after])
+
+        assert result.import_regressions == {
+            "fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'",
+        }
+        assert result.dep_file_updated is False
+        assert "import" in result.write_back_skipped
+        assert req.read_text() == "fastmcp==3.4.7\n"
+
+    def test_failures_already_present_in_baseline_do_not_block(self, tmp_path: Path) -> None:
+        req = tmp_path / "requirements.txt"
+        req.write_text("fastmcp==3.4.7\n")
+        missing = {"pytest": "No module named 'pytest'"}
+        baseline = ImportCheck(verified=["fastmcp"], failed=dict(missing))
+        after = ImportCheck(verified=["fastmcp"], failed=dict(missing))
+        result = self._run(tmp_path, [baseline, after])
+
+        assert result.import_regressions == {}
+        assert result.dep_file_updated is True
+        assert "fastmcp==4.1.4" in req.read_text()
 
 
 # ---------------------------------------------------------------------------

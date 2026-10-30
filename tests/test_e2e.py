@@ -130,13 +130,14 @@ if sys.argv[1:3] == ["-m", "pip_audit"]:
     pip_audit = str(Path(__file__).resolve().parent / "pip-audit")
     os.execv(pip_audit, [pip_audit, *sys.argv[3:]])
 
-if len(sys.argv) >= 3 and sys.argv[1] == "-c":
-    code = sys.argv[2]
+argv = [arg for arg in sys.argv[1:] if arg != "-I"]
+if len(argv) >= 2 and argv[0] == "-c":
+    code = argv[1]
     if "stdlib_module_names" in code:
         print(json.dumps(["__future__", "json", "pathlib", "sys"]))
         raise SystemExit(0)
-    if "packages_distributions" in code:
-        modules = json.loads(sys.argv[3])
+    if "find_spec" in code:
+        modules = json.loads(argv[2])
         installed = set(state["packages"])
         results = {{}}
         for mod in modules:

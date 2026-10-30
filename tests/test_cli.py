@@ -77,6 +77,28 @@ class TestExitCodes:
         with patch("depfresh.cli.upgrade", return_value=result):
             main(["/some/path"])  # must not raise
 
+    def test_import_regressions_exit_3(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = _make_result(
+            import_regressions={"fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'"},
+        )
+        with patch("depfresh.cli.upgrade", return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/some/path"])
+        assert exc_info.value.code == 3
+        out = capsys.readouterr().out
+        assert "fastmcp.tools.tool" in out
+        assert "not written" in out
+
+    def test_import_regressions_take_precedence_over_remaining_vulns(self) -> None:
+        from depfresh.models import Vulnerability
+
+        vuln = Vulnerability("foo", "1.0", "CVE-2024-1234", "2.0", "bad")
+        result = _make_result(post_audit_vulns=[vuln], import_regressions={"foo.bar": "gone"})
+        with patch("depfresh.cli.upgrade", return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/some/path"])
+        assert exc_info.value.code == 3
+
     def test_remaining_vulns_exits_2(self) -> None:
         from depfresh.models import Vulnerability
 

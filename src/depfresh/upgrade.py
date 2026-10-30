@@ -37,7 +37,7 @@ from depfresh.uv import (
     install_requirements,
     run,
 )
-from depfresh.verify import verify_imports
+from depfresh.verify import import_regressions, verify_imports
 
 log = logging.getLogger("depfresh")
 
@@ -437,6 +437,7 @@ def upgrade(
         pre_vulns = _run_audit_with_temp(
             ctx.audit_python, ctx.work_dir, ctx.old_pkgs, "pre-upgrade",
         )
+        baseline_check = verify_imports(ctx.target_dir, ctx.venv_python, label="baseline")
 
         log.info("Building upgrade constraints")
         constraints = build_constraints(
@@ -449,7 +450,7 @@ def upgrade(
 
         new_pkgs = freeze(ctx.uv, ctx.venv_python)
 
-        import_check = verify_imports(ctx.target_dir, ctx.venv_python)
+        import_check = verify_imports(ctx.target_dir, ctx.venv_python, label="upgraded")
 
         post_vulns = _run_audit_with_temp(
             ctx.audit_python, ctx.work_dir, new_pkgs, "post-upgrade",
@@ -480,6 +481,8 @@ def upgrade(
         keep_version=keep_version,
         dry_run=dry_run,
         import_check=import_check,
+        import_check_baseline=baseline_check,
+        import_regressions=import_regressions(baseline_check, import_check),
         pre_audit_vulns=pre_vulns,
         post_audit_vulns=post_vulns,
         remaining_reasons=remaining_reasons,
@@ -491,7 +494,17 @@ def upgrade(
         final_count=len(new_pkgs),
     )
 
-    if not dry_run:
+    if result.import_regressions:
+        result.write_back_skipped = (
+            f"{len(result.import_regressions)} import(s) resolved before the upgrade "
+            "and fail after it"
+        )
+        log.error(
+            "NOT writing %s: %s: %s",
+            ctx.req_path.name, result.write_back_skipped,
+            ", ".join(result.import_regressions),
+        )
+    elif not dry_run:
         ctx.handler.write(
             new_pkgs,
             ctx.req_path,

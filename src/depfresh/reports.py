@@ -113,6 +113,21 @@ def write_log(report: UpgradeResult, out_dir: Path, date_prefix: str) -> Path:
 
     # Import verification
     lines += ["", "", "== IMPORT VERIFICATION " + "=" * 56, ""]
+    if report.import_check_baseline:
+        base = report.import_check_baseline
+        lines.append(
+            f"Baseline (before upgrade): {len(base.verified)} resolved, "
+            f"{len(base.failed)} unresolved"
+        )
+    if report.import_regressions:
+        lines.append("")
+        lines.append(
+            f"REGRESSIONS ({len(report.import_regressions)}): resolved before the upgrade, "
+            "fail after it. The dependency file was NOT written."
+        )
+        for mod, err in report.import_regressions.items():
+            lines.append(f"  {mod}: {err}")
+        lines.append("")
     if report.import_check:
         ic = report.import_check
         n_stdlib = ic.total_imports - len(ic.verified) - len(ic.failed) - len(ic.skipped_local)
@@ -152,17 +167,23 @@ def write_log(report: UpgradeResult, out_dir: Path, date_prefix: str) -> Path:
         f"- New transitive dependencies: {len(report.new_deps)}",
         f"- Pre-upgrade vulnerabilities: {len(report.pre_audit_vulns)}",
         f"- Post-upgrade vulnerabilities: {len(report.post_audit_vulns)}",
-        (
-            f"- Dependency file updated: {report.requirements_path}"
-            if report.dep_file_updated
-            else f"- Dependency file updated: no ({'dry-run' if report.dry_run else 'not written'})"
-        ),
+        f"- Import regressions: {len(report.import_regressions)}",
+        f"- Dependency file updated: {_write_back_status(report)}",
         sep,
     ]
 
     path.write_text("\n".join(lines) + "\n")
     log.debug("Wrote log: %s", path)
     return path
+
+
+def _write_back_status(report: UpgradeResult) -> str:
+    """One-line description of whether (and why not) the dependency file was written."""
+    if report.dep_file_updated:
+        return report.requirements_path
+    if report.write_back_skipped:
+        return f"no ({report.write_back_skipped})"
+    return f"no ({'dry-run' if report.dry_run else 'not written'})"
 
 
 # ---------------------------------------------------------------------------
@@ -384,6 +405,26 @@ def _md_import_verification(md: list[str], report: UpgradeResult) -> None:
         f"found **{ic.total_imports}** unique imports."
     )
     md.append("")
+    if report.import_check_baseline:
+        base = report.import_check_baseline
+        md.append(
+            f"Before the upgrade, {len(base.verified)} third-party imports resolved and "
+            f"{len(base.failed)} did not; only imports that resolved before and fail after "
+            "count as regressions."
+        )
+        md.append("")
+    if report.import_regressions:
+        md.append(
+            f"### Regressions ({len(report.import_regressions)}): "
+            "the dependency file was not written"
+        )
+        md.append("")
+        _md_table(
+            md,
+            ["Module", "Error after the upgrade"],
+            [[f"`{mod}`", err] for mod, err in report.import_regressions.items()],
+        )
+        md.append("")
     _md_table(
         md,
         ["Category", "Count"],
@@ -437,18 +478,24 @@ def _md_checklist(md: list[str], report: UpgradeResult) -> None:
     if report.dep_file_updated:
         md.append(f"- [x] Dependency file updated ({report.final_count} packages)")
     else:
-        md.append(
-            f"- [ ] Dependency file updated ({'dry-run' if report.dry_run else 'not written'})"
-        )
+        md.append(f"- [ ] Dependency file updated: {_write_back_status(report)}")
     if remaining == 0:
         md.append("- [x] Post-upgrade audit: **0 vulnerabilities found**")
     else:
         md.append(f"- [ ] Post-upgrade audit: **{remaining} vulnerabilities remain**")
     if report.import_check:
         ic = report.import_check
-        if ic.failed:
+        if report.import_regressions:
             md.append(
-                f"- [ ] Import verification: **{len(ic.failed)} imports failed** "
+                f"- [ ] Import verification: **{len(report.import_regressions)} regressions** "
+                f"(see Import Verification section)"
+            )
+        elif ic.failed:
+            md.append(
+                f"- [x] Import verification: no regressions "
+                f"({len(ic.failed)} imports were already unresolved before the upgrade)"
+                if report.import_check_baseline
+                else f"- [ ] Import verification: **{len(ic.failed)} imports failed** "
                 f"(see Import Verification section)"
             )
         else:
