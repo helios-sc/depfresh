@@ -215,6 +215,17 @@ class TestPyprojectDocument:
         deps = tomllib.loads(out)["project"]["dependencies"]
         assert deps == ["pandas", "pypdf>=6.21,<7", "urllib3>=2.8.0"]
 
+    def test_crlf_files_stay_crlf(self) -> None:
+        text = ('[project]\r\nname = "x"\r\ndependencies = [\r\n    "pypdf>=6.21,<6.22",\r\n]'
+                '\r\n\r\n[project.optional-dependencies]\r\ngcs = ["a==1"]\r\n')
+        doc = PyprojectDocument(text, ["gcs"], False)
+        doc.set_spec("pypdf", ">=6.25.0,<6.26")
+        doc.append("urllib3>=2.8.0  # depfresh: GHSA-x")
+        doc.append("idna>=3.15  # depfresh: GHSA-y", extra="gcs")
+        out = doc.render()
+        assert "urllib3>=2.8.0" in out and "idna>=3.15" in out
+        assert out.count("\n") == out.count("\r\n")
+
     def test_appends_into_an_extra(self) -> None:
         doc = PyprojectDocument(self.TEXT, ["gcs"], False)
         doc.append("protobuf>=6.33.5  # depfresh: GHSA-x", extra="gcs")
@@ -408,6 +419,60 @@ class TestNonPyPIIndexes:
         assert outcome.audited_count == 1
         assert outcome.not_audited == [
             f"private-widget==0.1.0 (private index {self.PRIVATE}; not audited)",
+        ]
+
+
+class TestTransitiveFloorPlacement:
+    """A vulnerable transitive package gets its floor in the list that pulls it."""
+
+    TEXT = dedent("""\
+        [project]
+        name = "demo-api"
+        version = "0.1.0"
+        dependencies = ["six==1.17.0"]
+
+        [project.optional-dependencies]
+        other = ["idna==3.11"]
+        gcs = ["google-cloud-storage==2.10.0"]
+    """)
+    UNIVERSE = {"six": ["1.17.0"], "idna": ["3.11"], "google-cloud-storage": ["2.10.0"],
+                "urllib3": ["2.6.3", "2.8.0"]}
+
+    def _run(self, tmp_path: Path, **options: Any) -> Any:
+        from depfresh.pipmode import PyprojectDocument
+
+        resolver = FakeResolver(self.UNIVERSE,
+                                {("google-cloud-storage", "2.10.0"): {"urllib3": ">=2"}})
+
+        def compile_pyproject(ws: PipWorkspace, manifest: Path, **kwargs: Any) -> Resolution:
+            doc = PyprojectDocument(manifest.read_text(), ws.options.extras,
+                                    ws.options.all_extras)
+            req_file = manifest.with_name("as-requirements.txt")
+            req_file.write_text("".join(f"{n}{s}\n" for n, s in doc.listed().items()))
+            if "urllib3" not in doc.listed():  # an old cache keeps the vulnerable release
+                kwargs["preferences"] = "urllib3==2.6.3\n"
+            return resolver(ws, req_file, **kwargs)
+
+        compile_pyproject.universe = self.UNIVERSE  # type: ignore[attr-defined]
+        return _remediate(tmp_path, self.TEXT, compile_pyproject,  # type: ignore[arg-type]
+                          {"urllib3": {"2.6.3"}}, {"urllib3": "2.8.0"},
+                          fmt=DependencyFormat.PYPROJECT_PEP621, name="pyproject.toml",
+                          **options)
+
+    @pytest.mark.parametrize("options", [
+        {"all_extras": True},
+        {"extras": ("other", "gcs")},
+        {"extras": ("gcs",)},
+    ])
+    def test_the_floor_goes_to_the_extra_that_pulls_it(
+        self, tmp_path: Path, options: dict[str, Any],
+    ) -> None:
+        outcome = self._run(tmp_path, **options)
+        data = tomllib.loads(outcome.new_text)
+        assert data["project"]["dependencies"] == ["six==1.17.0"]
+        assert data["project"]["optional-dependencies"]["other"] == ["idna==3.11"]
+        assert data["project"]["optional-dependencies"]["gcs"] == [
+            "google-cloud-storage==2.10.0", "urllib3>=2.8.0",
         ]
 
 

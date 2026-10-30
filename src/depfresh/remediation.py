@@ -209,6 +209,26 @@ def disallowed_majors(
     ]
 
 
+def introduced_findings(
+    before: Iterable[Vulnerability], after: Iterable[Vulnerability],
+) -> list[Vulnerability]:
+    """Findings of *after* whose package did not have that advisory in *before*.
+
+    A co-upgrade can move a package onto a release with an advisory of its
+    own; such a result trades one vulnerability for another.
+    """
+    seen = {(normalise(v.package), i) for v in before for i in v.ids}
+    return [v for v in after if not any((normalise(v.package), i) in seen for i in v.ids)]
+
+
+def introduced_reason(introduced: list[Vulnerability]) -> str:
+    """The write-back refusal for :func:`introduced_findings`."""
+    listed = ", ".join(f"{v.package} {v.version} {v.ghsa or v.cve}" for v in introduced[:5])
+    more = f" and {len(introduced) - 5} more" if len(introduced) > 5 else ""
+    return (f"the changes bring in {len(introduced)} advisories that were not there before "
+            f"({listed}{more})")
+
+
 def database_findings(vulns: Iterable[Vulnerability]) -> list[Vulnerability]:
     """The findings of the advisory database (everything but repository advisories)."""
     return [v for v in vulns if not v.from_repository]

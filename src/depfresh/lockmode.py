@@ -56,6 +56,7 @@ from depfresh.remediation import (
     record_plans,
     snapshot_plans,
 )
+from depfresh.textio import with_newlines_of
 from depfresh.uv import run, uv_env
 
 if sys.version_info >= (3, 11):
@@ -687,7 +688,7 @@ def remediate_lock(
         log.warning("%s", notes[-1])
     current = baseline
     current_vulns = pre_vulns
-    pyproject_before = project.pyproject_path.read_text(encoding="utf-8")
+    pyproject_before = project.pyproject_path.read_bytes().decode("utf-8")
 
     if audit_only:
         plans = plan(pre_vulns, baseline.pins, options, sources, baseline.private)
@@ -762,7 +763,8 @@ def remediate_lock(
     if gate.enabled:
         _after_imports(gate, project, venv, options, local)
 
-    pyproject_after = project.pyproject_path.read_text(encoding="utf-8")
+    pyproject_after = with_newlines_of(project.pyproject_path.read_bytes().decode("utf-8"),
+                                       pyproject_before)
     pyproject_diff = "".join(difflib.unified_diff(
         pyproject_before.splitlines(keepends=True), pyproject_after.splitlines(keepends=True),
         fromfile="a/pyproject.toml", tofile="b/pyproject.toml",
@@ -827,11 +829,11 @@ def _apply_one(
     snapshot_pyproject = project.pyproject_path.read_bytes()
     ok, output = project.lock_upgrade({name: version})
     if not ok:
-        text = project.pyproject_path.read_text(encoding="utf-8")
+        text = project.pyproject_path.read_bytes().decode("utf-8")
         blocker = blocking_constraint(text, name, version)
         if blocker is not None:
-            project.pyproject_path.write_text(
-                admit_in_pyproject(text, name, version), encoding="utf-8",
+            project.pyproject_path.write_bytes(
+                with_newlines_of(admit_in_pyproject(text, name, version), text).encode("utf-8"),
             )
             log.info("%s: direct constraint %r excludes %s; raising it", name, blocker, version)
             ok, output = project.lock_upgrade({name: version})

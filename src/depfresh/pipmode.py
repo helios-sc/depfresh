@@ -67,7 +67,7 @@ from depfresh.reqlines import (
     inspect_tree,
     parse_lines,
 )
-from depfresh.textio import TextFile, read_text_file
+from depfresh.textio import TextFile, read_text_file, with_newlines_of
 from depfresh.uv import create_venv, run, uv_env
 
 log = logging.getLogger("depfresh")
@@ -384,6 +384,7 @@ class PyprojectDocument:
         self, text: str, extras: Iterable[str], all_extras: bool, env: TargetEnv | None = None,
     ) -> None:
         self.env = env
+        self.original = text
         self.doc = tomlkit.parse(text)
         self.extras = list(extras)
         self.all_extras = all_extras
@@ -452,7 +453,7 @@ class PyprojectDocument:
         target.add_line(requirement.strip(), comment=comment.strip() or None)
 
     def render(self) -> str:
-        return tomlkit.dumps(self.doc)
+        return with_newlines_of(tomlkit.dumps(self.doc), self.original)
 
 
 def strip_pyproject_direct_refs(text: str) -> str:
@@ -560,7 +561,7 @@ class PipWorkspace:
         self.commands: list[str] = []
         self.ignore_direct_references = ignore_direct_references
         self.counter = 0
-        self._runtime_pins: dict[str, str] | None = None
+        self._extra_pins: dict[str | None, dict[str, str]] = {}
         self.tree: RequirementsTree | None = None
         #: What counts as private: the manifest's own pins (pyproject.toml),
         #: or those of the pyproject.toml files next to a requirements file
@@ -620,16 +621,20 @@ class PipWorkspace:
 
     def runtime_pins(self) -> dict[str, str]:
         """The resolution without any extra (where a transitive floor belongs)."""
-        if self._runtime_pins is None:
+        return self.extra_pins(None)
+
+    def extra_pins(self, extra: str | None) -> dict[str, str]:
+        """The resolution of the original manifest with only *extra* (``None``: none)."""
+        if extra not in self._extra_pins:
             saved = self.options
-            self.options = RemediationOptions(env=saved.env)
+            self.options = RemediationOptions(env=saved.env, extras=(extra,) if extra else ())
             try:
-                self._runtime_pins = self.compile(self.write(self.original.text)).pins
+                self._extra_pins[extra] = self.compile(self.write(self.original.text)).pins
             except CommandError:
-                self._runtime_pins = {}
+                self._extra_pins[extra] = {}
             finally:
                 self.options = saved
-        return self._runtime_pins
+        return self._extra_pins[extra]
 
     def compile(
         self,
@@ -977,10 +982,18 @@ def _render(
 
 
 def _extra_for(name: str, ws: PipWorkspace, options: RemediationOptions) -> str | None:
-    """Where a transitive floor goes in pyproject: runtime deps unless only an extra pulls it."""
-    if not options.extras or name in ws.runtime_pins():
+    """Where a transitive floor goes in pyproject.toml.
+
+    ``[project].dependencies`` when the runtime set pulls the package (or
+    nothing selected does), otherwise the first selected extra, in the order
+    the file declares them, whose own resolution pulls it.
+    """
+    if not (options.extras or options.all_extras) or name in ws.runtime_pins():
         return None
-    return options.extras[0]
+    declared = list(tomlkit.parse(ws.original.text).unwrap().get("project", {})
+                    .get("optional-dependencies", {}))
+    selected = [g for g in declared if options.all_extras or g in options.extras]
+    return next((g for g in selected if name in ws.extra_pins(g)), None)
 
 
 def _plan_edits(

@@ -486,6 +486,19 @@ class TestRemediateLock:
         assert "+" in outcome.pyproject_diff
         assert any("excluded the fix" in note for note in outcome.notes)
 
+    def test_a_crlf_pyproject_stays_crlf(self, tmp_path: Path) -> None:
+        pyproject = ('[project]\r\nname = "demo"\r\n'
+                     'dependencies = [\r\n    "cryptography>=41,<49",\r\n]\r\n')
+        outcome, _ = _run(
+            tmp_path, lambda root: FakeProject(root, self.BASE, {}, pyproject),
+            FakeAuditor({"cryptography": {"48.0.1"}}),
+            FakeSources({"cryptography": "50.0.0"}, self.RELEASES), allow_major=[],
+        )
+        assert outcome.new_pyproject is not None
+        text = outcome.new_pyproject.decode()
+        assert '"cryptography>=50.0.0,<51"' in text
+        assert text.count("\r\n") == text.count("\n") == 5
+
     def test_unapproved_major_co_upgrade_is_reverted(self, tmp_path: Path) -> None:
         auditor = FakeAuditor({"aiohttp": {"3.14.1"}})
         sources = FakeSources({"aiohttp": "3.14.4"}, self.RELEASES)
@@ -651,6 +664,18 @@ class TestUpgradeLockMode:
         assert mock.called
         return result
 
+    def test_an_advisory_a_co_upgrade_brings_in_blocks_the_write_back(
+        self, tmp_path: Path,
+    ) -> None:
+        outcome = self._outcome(tmp_path)
+        outcome.post_vulns = [Vulnerability("six", "1.17.1", "GHSA-new", "", "")]
+        result = self._upgrade(tmp_path, outcome, python="3.12")
+        assert (tmp_path / "proj" / "uv.lock").read_text() == "old lock\n"
+        assert result.write_back_skipped == (
+            "the changes bring in 1 advisories that were not there before "
+            "(six 1.17.1 GHSA-new)"
+        )
+
     @pytest.mark.parametrize("dry_run", [False, True])
     def test_an_open_advisory_keeps_its_own_reason(self, tmp_path: Path, dry_run: bool) -> None:
         from depfresh.advisories import FixPlan
@@ -789,6 +814,29 @@ class TestSubproject:
         assert project.scope.pinned == {"private-widget": "internal"}
         assert project.scope.is_private("other", PRIVATE)
 
+    def test_path_sources_get_a_full_copy_without_caches(self, tmp_path: Path) -> None:
+        """Workspaces and path sources need the tree; VCS data, venvs and caches stay out."""
+        from depfresh.lockmode import LockProject
+
+        target = tmp_path / "proj"
+        (target / "libs" / "core").mkdir(parents=True)
+        (target / "pyproject.toml").write_text(
+            '[project]\nname = "app"\nversion = "1"\ndependencies = ["core"]\n'
+            '[tool.uv.sources]\ncore = { path = "libs/core" }\n'
+        )
+        (target / "libs" / "core" / "pyproject.toml").write_text(
+            '[project]\nname = "core"\nversion = "1"\ndependencies = []\n'
+        )
+        (target / "uv.lock").write_text(_lock_text({"six": "1.17.0"}))
+        for junk in (".git", ".venv", "node_modules", "reports", "src/__pycache__"):
+            (target / junk).mkdir(parents=True)
+            (target / junk / "x").write_text("")
+        (target / "src" / "app.py").write_text("import core\n")
+        project = LockProject("/usr/bin/uv", target, tmp_path / "work")
+        copied = sorted(str(p.relative_to(project.root)) for p in project.root.rglob("*")
+                        if p.is_file())
+        assert copied == ["libs/core/pyproject.toml", "pyproject.toml", "src/app.py", "uv.lock"]
+
     def test_scratch_copy_keeps_the_settings_above_the_subproject(self, tmp_path: Path) -> None:
         from depfresh.lockmode import LockProject
 
@@ -850,6 +898,22 @@ class TestSubproject:
             )
         assert made == [(sub, target)]
         assert outcome.gate.target_dir == sub
+
+
+class TestLatestStrategyOnALock:
+    def test_is_refused(self, tmp_path: Path) -> None:
+        """--strategy latest would rewrite pyproject.toml and leave uv.lock stale."""
+        pyproject = '[project]\nname = "x"\nversion = "1"\ndependencies = ["six"]\n'
+        (tmp_path / "pyproject.toml").write_text(pyproject)
+        (tmp_path / "uv.lock").write_text("lock\n")
+        with (
+            patch.object(_upgrade_mod, "find_uv") as find_uv,
+            pytest.raises(DepfreshError, match="the lock is what ships"),
+        ):
+            upgrade(tmp_path, strategy="latest", python="3.12")
+        assert not find_uv.called
+        assert (tmp_path / "pyproject.toml").read_text() == pyproject
+        assert (tmp_path / "uv.lock").read_text() == "lock\n"
 
 
 class TestWorkspaceMembers:

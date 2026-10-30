@@ -19,6 +19,8 @@ from depfresh.textio import (
     decode_bytes,
     read_text,
     read_text_file,
+    replace_together,
+    with_newlines_of,
     write_text_like,
 )
 
@@ -95,3 +97,44 @@ class TestUtf16Requirements:
         RequirementsInHandler().write({"flask": "2.3.3"}, path)
         assert path.read_bytes().startswith(codecs.BOM_UTF16_LE)
         assert "flask==2.3.3" in read_text(path)
+
+
+class TestReplaceTogether:
+    def test_writes_every_file_and_keeps_permissions(self, tmp_path: Path) -> None:
+        lock, pyproject = tmp_path / "uv.lock", tmp_path / "pyproject.toml"
+        lock.write_text("old lock\n")
+        pyproject.write_text("old\n")
+        pyproject.chmod(0o640)
+        replace_together({lock: b"new lock\n", pyproject: b"new\n"})
+        assert (lock.read_text(), pyproject.read_text()) == ("new lock\n", "new\n")
+        assert pyproject.stat().st_mode & 0o777 == 0o640
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["pyproject.toml", "uv.lock"]
+
+    def test_both_or_neither(self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+        import os
+
+        lock, pyproject = tmp_path / "uv.lock", tmp_path / "pyproject.toml"
+        lock.write_text("old lock\n")
+        pyproject.write_text("old\n")
+        real_replace = os.replace
+        calls: list[str] = []
+
+        def second_fails(src: str, dst: str) -> None:
+            calls.append(str(dst))
+            if len(calls) == 2:
+                raise OSError("disk full")
+            real_replace(src, dst)
+
+        monkeypatch.setattr("depfresh.textio.os.replace", second_fails)
+        with pytest.raises(OSError, match="disk full"):
+            replace_together({lock: b"new lock\n", pyproject: b"new\n"})
+        assert (lock.read_text(), pyproject.read_text()) == ("old lock\n", "old\n")
+        assert sorted(p.name for p in tmp_path.iterdir()) == ["pyproject.toml", "uv.lock"]
+
+
+class TestWithNewlinesOf:
+    def test_crlf_original(self) -> None:
+        assert with_newlines_of("a\nb\r\nc\n", "x\r\n") == "a\r\nb\r\nc\r\n"
+
+    def test_lf_original(self) -> None:
+        assert with_newlines_of("a\nb\n", "x\n") == "a\nb\n"

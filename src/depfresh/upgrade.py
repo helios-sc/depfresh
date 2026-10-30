@@ -68,13 +68,21 @@ from depfresh.remediation import (
     RemediationOptions,
     default_sources,
     diff_sets,
+    introduced_findings,
+    introduced_reason,
     planned_fixes,
     remaining_reasons,
 )
 from depfresh.repoadvisories import ProjectUrls, RepoAdvisoryChecker
 from depfresh.reports import write_log, write_markdown
 from depfresh.reqlines import inspect_tree
-from depfresh.textio import decode_bytes, read_text_file, write_text_like
+from depfresh.textio import (
+    decode_bytes,
+    read_text_file,
+    replace_together,
+    with_newlines_of,
+    write_text_like,
+)
 from depfresh.uv import (
     cleanup_venv,
     create_venv,
@@ -360,7 +368,14 @@ def _render_write(
         copy = Path(tmp) / req_path.name
         shutil.copy2(req_path, copy)
         handler.write(pkgs, copy, **kwargs)
-        return copy.read_bytes()
+        rendered = copy.read_bytes()
+    original = req_path.read_bytes()
+    if b"\r\n" in original and b"\r\n" not in rendered:
+        try:  # a TOML writer that dropped the file's CRLF line endings
+            return with_newlines_of(rendered.decode("utf-8"), "\r\n").encode("utf-8")
+        except UnicodeDecodeError:
+            return rendered
+    return rendered
 
 
 def manifest_diff(path: Path, new_content: bytes) -> str:
@@ -573,7 +588,7 @@ def _upgrade_latest(
         )
     elif not dry_run:
         if result.manifest_diff:
-            ctx.req_path.write_bytes(new_content)
+            replace_together({ctx.req_path: new_content})
             result.dep_file_updated = True
             log.info("%s UPDATED", ctx.req_path)
         else:
@@ -858,6 +873,8 @@ def _lock_result(
         ))
     elif outcome.lock_check.startswith("failed"):
         _withhold(result, f"uv lock --check {outcome.lock_check}")
+    elif introduced := introduced_findings(outcome.pre_vulns, outcome.post_vulns):
+        _withhold(result, introduced_reason(introduced))
     return result
 
 
@@ -935,10 +952,12 @@ def _run_lock_mode(
     elif options.dry_run:
         log.info("DRY RUN — %s NOT modified", ", ".join(result.files_changed) or "nothing")
     elif result.files_changed:
+        files: dict[Path, bytes] = {}
         if outcome.new_lock is not None:
-            (manifest.project_dir / "uv.lock").write_bytes(outcome.new_lock)
+            files[manifest.project_dir / "uv.lock"] = outcome.new_lock
         if outcome.new_pyproject is not None:
-            manifest.path.write_bytes(outcome.new_pyproject)
+            files[manifest.path] = outcome.new_pyproject
+        replace_together(files)  # both or neither
         result.dep_file_updated = True
         log.info("UPDATED %s", ", ".join(result.files_changed))
     else:
@@ -1027,6 +1046,8 @@ def _pip_result(
         ))
     elif outcome.resolution_check.startswith("failed"):
         _withhold(result, f"the edited manifest does not resolve for {options.env.platform}")
+    elif introduced := introduced_findings(outcome.pre_vulns, outcome.post_vulns):
+        _withhold(result, introduced_reason(introduced))
     return result
 
 
@@ -1082,7 +1103,18 @@ def _validate_inputs(
 
 
 def _check_latest_sources(manifest: _Manifest) -> None:
-    """The latest strategy installs a synthesized file: it cannot honour package sources."""
+    """What --strategy latest cannot do: a uv project's lock, or package sources.
+
+    It installs a synthesized requirements file and rewrites the manifest, so
+    it can neither update a ``uv.lock`` nor honour ``[tool.uv.sources]``.
+    """
+    if manifest.is_uv_lock_project:
+        raise DepfreshError(
+            f"{manifest.path} has a uv.lock next to it, and the lock is what ships. "
+            "--strategy latest would rewrite pyproject.toml, leave uv.lock stale and audit a "
+            "fresh resolution instead of the lock. Use the default minimal strategy, which "
+            "audits and fixes uv.lock."
+        )
     if manifest.fmt == DependencyFormat.PYPROJECT_PEP621:
         pinned = sorted(set(uv_source_indexes(manifest.path)) | set(
             local_sources(tomllib.loads(manifest.path.read_text(encoding="utf-8")))

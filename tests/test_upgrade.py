@@ -578,6 +578,34 @@ class TestSubprojectPyproject:
         assert result.requirements_path == "sub/pyproject.toml"
         assert result.files_changed == ["sub/pyproject.toml"]
 
+    def test_an_advisory_the_changes_bring_in_blocks_the_write_back(
+        self, tmp_path: Path,
+    ) -> None:
+        from depfresh.pipmode import PipOutcome, Resolution
+        from depfresh.remediation import ImportGate
+
+        target = self._tree(tmp_path)
+        sub = target / "sub"
+        new_text = self.SUB.replace("idna==3.6", "idna==3.15")
+        outcome = PipOutcome(
+            baseline=Resolution(pins={"idna": "3.6"}), final=Resolution(pins={"idna": "3.15"}),
+            pre_vulns=[Vulnerability("idna", "3.6", "GHSA-x", "3.15", "")],
+            post_vulns=[Vulnerability("idna", "3.15", "GHSA-later", "", "")],
+            plans={}, failures={}, new_text=new_text, changed=True,
+            resolution_check="passed", commands=[], notes=[], not_audited=[],
+            gate=ImportGate(False, sub), direct_refs=[], original_text=self.SUB,
+        )
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.13.6"),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
+            patch.object(_upgrade_mod, "remediate_pip", return_value=outcome),
+        ):
+            result = upgrade(target, dep_file="sub/pyproject.toml", python="3.12",
+                             reports_dir=tmp_path / "reports")
+        assert (sub / "pyproject.toml").read_text() == self.SUB
+        assert "bring in 1 advisories" in result.write_back_skipped
+
     def test_dep_file_outside_the_target_is_refused(self, tmp_path: Path) -> None:
         from depfresh.exceptions import DepfreshError
 
