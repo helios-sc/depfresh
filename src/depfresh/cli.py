@@ -154,6 +154,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Audit what ships and show the fix plan; change nothing",
     )
     parser.add_argument(
+        "--repo-advisories", action="store_true",
+        help=(
+            "Also check the GitHub repository advisories of every shipped package, which "
+            "reach the GitHub Advisory Database late (needs an authenticated gh CLI)"
+        ),
+    )
+    parser.add_argument(
         "--skip-import-check", action="store_true",
         help=(
             "Do not install the before/after sets on this machine to compare imports "
@@ -205,6 +212,7 @@ def main(argv: list[str] | None = None) -> None:
                 groups=args.groups,
                 all_groups=args.all_groups,
                 platform=args.platform,
+                repo_advisories=args.repo_advisories,
             )
         else:
             result = upgrade(
@@ -228,6 +236,7 @@ def main(argv: list[str] | None = None) -> None:
                 all_groups=args.all_groups,
                 platform=args.platform,
                 import_check=not args.skip_import_check,
+                repo_advisories=args.repo_advisories,
             )
     except (DepfreshError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)

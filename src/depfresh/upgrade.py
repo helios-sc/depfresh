@@ -10,7 +10,7 @@ import shutil
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Literal
+from typing import Literal, cast
 
 from depfresh.advisories import DEFAULT_PLATFORM, AdvisorySources, TargetEnv
 from depfresh.audit import install_pip_audit, run_audit, write_pinned_requirements
@@ -51,6 +51,7 @@ from depfresh.remediation import (
     planned_fixes,
     remaining_reasons,
 )
+from depfresh.repoadvisories import ProjectUrls, RepoAdvisoryChecker
 from depfresh.reports import write_log, write_markdown
 from depfresh.textio import decode_bytes, read_text_file, write_text_like
 from depfresh.uv import (
@@ -790,6 +791,17 @@ def _lock_result(
     return result
 
 
+def _auditor(
+    audit_python: str, work_dir: Path, sources: AdvisorySources, repo_advisories: bool,
+) -> Auditor:
+    checker = None
+    if repo_advisories:
+        if not hasattr(sources, "project_urls"):
+            raise DepfreshError("--repo-advisories needs advisory sources that know PyPI URLs")
+        checker = RepoAdvisoryChecker(urls=cast(ProjectUrls, sources))
+    return Auditor(audit_python, work_dir, repo_check=checker)
+
+
 def _run_lock_mode(
     manifest: _Manifest,
     options: RemediationOptions,
@@ -800,9 +812,11 @@ def _run_lock_mode(
     dependency_scope: DependencyScope,
     sources: AdvisorySources | None,
     audit_only_run: bool,
+    repo_advisories: bool = False,
 ) -> UpgradeResult:
     uv = find_uv(uv_binary)
     uv_version = get_uv_version(uv)
+    sources = sources or default_sources()
     log.info("depfresh — lock-aware %s of %s (uv %s at %s)",
              "audit" if audit_only_run else "remediation", manifest.target_dir, uv_version, uv)
     log.info("  target: %s, Python %s; groups: %s; extras: %s",
@@ -814,18 +828,20 @@ def _run_lock_mode(
         audit_python, pip_audit_version = install_pip_audit(
             uv, work_dir / ".pip-audit-tool", options.env.python_minor,
         )
+        auditor = _auditor(audit_python, work_dir, sources, repo_advisories)
         outcome = remediate_lock(
             uv=uv,
             target_dir=manifest.target_dir,
             work_dir=work_dir,
-            auditor=Auditor(audit_python, work_dir),
+            auditor=auditor,
             options=options,
-            sources=sources or default_sources(),
+            sources=sources,
             venv_name=venv_name,
             audit_only=audit_only_run,
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+    outcome.notes.extend(auditor.notes())
 
     result = _lock_result(
         outcome, manifest=manifest, options=options, uv_version=uv_version,
@@ -989,9 +1005,11 @@ def _run_pip_mode(
     ignore_direct_references: bool,
     sources: AdvisorySources | None,
     audit_only_run: bool,
+    repo_advisories: bool = False,
 ) -> UpgradeResult:
     uv = find_uv(uv_binary)
     uv_version = get_uv_version(uv)
+    sources = sources or default_sources()
     log.info("depfresh — %s of %s, resolved for %s / Python %s (uv %s at %s)",
              "audit" if audit_only_run else "minimal remediation", manifest.path,
              options.env.platform, options.env.python_version, uv_version, uv)
@@ -1008,15 +1026,16 @@ def _run_pip_mode(
             else manifest.path,
             fmt=DependencyFormat.REQUIREMENTS_IN if is_setup_py else manifest.fmt,
             work_dir=work_dir,
-            auditor=Auditor(audit_python, work_dir),
+            auditor=(auditor := _auditor(audit_python, work_dir, sources, repo_advisories)),
             options=options,
-            sources=sources or default_sources(),
+            sources=sources,
             venv_name=venv_name,
             ignore_direct_references=ignore_direct_references,
             audit_only=audit_only_run,
         )
     finally:
         shutil.rmtree(work_dir, ignore_errors=True)
+    outcome.notes.extend(auditor.notes())
 
     result = _pip_result(
         outcome, manifest=manifest, options=options, uv_version=uv_version,
@@ -1072,6 +1091,7 @@ def upgrade(
     platform: str = DEFAULT_PLATFORM,
     import_check: bool = True,
     sources: AdvisorySources | None = None,
+    repo_advisories: bool = False,
 ) -> UpgradeResult:
     """Audit Python dependencies and fix the vulnerable ones.
 
@@ -1144,6 +1164,9 @@ def upgrade(
         Compare imports before and after (installs both sets on this host).
     sources:
         Advisory/release sources (tests inject fakes; default OSV + PyPI).
+    repo_advisories:
+        Also check the GitHub repository advisories of every shipped package
+        (needs an authenticated ``gh``); they reach the Advisory DB late.
 
     Returns
     -------
@@ -1179,7 +1202,7 @@ def upgrade(
         result = _run_lock_mode(
             manifest, options, uv_binary=uv_binary, service_label=service_label,
             venv_name=venv_name, dependency_scope=dependency_scope, sources=sources,
-            audit_only_run=False,
+            audit_only_run=False, repo_advisories=repo_advisories,
         )
         _write_reports(result, _out_dir(reports_dir, service_label), result.date)
         return result
@@ -1210,7 +1233,7 @@ def upgrade(
             manifest, options, uv_binary=uv_binary, service_label=service_label,
             venv_name=venv_name, dependency_scope=dependency_scope,
             ignore_direct_references=ignore_direct_references, sources=sources,
-            audit_only_run=False,
+            audit_only_run=False, repo_advisories=repo_advisories,
         )
         _write_reports(result, _out_dir(reports_dir, service_label), result.date)
         return result
@@ -1249,6 +1272,7 @@ def audit_only(
     all_groups: bool = False,
     platform: str = DEFAULT_PLATFORM,
     sources: AdvisorySources | None = None,
+    repo_advisories: bool = False,
 ) -> UpgradeResult:
     """Run a vulnerability audit of what ships, without changing anything.
 
@@ -1270,7 +1294,7 @@ def audit_only(
         return _run_lock_mode(
             manifest, options, uv_binary=uv_binary, service_label=derive_label(target_dir),
             venv_name=venv_name, dependency_scope=dependency_scope, sources=sources,
-            audit_only_run=True,
+            audit_only_run=True, repo_advisories=repo_advisories,
         )
     if manifest.fmt in (*PIP_FORMATS, DependencyFormat.SETUP_PY):
         _check_private_sources(manifest)
@@ -1284,7 +1308,7 @@ def audit_only(
             manifest, options, uv_binary=uv_binary, service_label=derive_label(target_dir),
             venv_name=venv_name, dependency_scope=dependency_scope,
             ignore_direct_references=ignore_direct_references, sources=sources,
-            audit_only_run=True,
+            audit_only_run=True, repo_advisories=repo_advisories,
         )
     _check_latest_sources(manifest)
     return _audit_only_legacy(

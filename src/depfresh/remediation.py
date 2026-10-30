@@ -27,6 +27,7 @@ from depfresh.advisories import (
 from depfresh.audit import run_audit, write_pinned_requirements
 from depfresh.constraints import classify_bump, normalise
 from depfresh.models import ImportCheck, PackageChange, PlannedFix, Vulnerability
+from depfresh.repoadvisories import RepoAdvisoryChecker
 from depfresh.verify import import_regressions, verify_imports
 
 log = logging.getLogger("depfresh")
@@ -65,11 +66,16 @@ class RemediationOptions:
 
 @dataclass
 class Auditor:
-    """Runs the pinned pip-audit tool over ``{name: version}`` sets."""
+    """Runs the pinned pip-audit tool over ``{name: version}`` sets.
+
+    With *repo_check* (``--repo-advisories``) every audit also includes the
+    GitHub repository advisories that are not in the Advisory DB yet.
+    """
 
     tool_python: str
     work_dir: Path
     calls: int = 0
+    repo_check: RepoAdvisoryChecker | None = None
 
     def audit(self, pins: Mapping[str, str], label: str) -> list[Vulnerability]:
         """Audit *pins* (already filtered for the target platform)."""
@@ -77,9 +83,29 @@ class Auditor:
         path = self.work_dir / f"audit-{self.calls}-{label}.txt"
         write_pinned_requirements(dict(pins), path)
         try:
-            return run_audit(self.tool_python, path, label)
+            vulns = run_audit(self.tool_python, path, label)
         finally:
             path.unlink(missing_ok=True)
+        if self.repo_check is not None:
+            extra = self.repo_check.findings(pins, vulns)
+            log.info("Repository advisories (%s): %d not yet in the Advisory DB", label, len(extra))
+            vulns = vulns + extra
+        return vulns
+
+    def notes(self) -> list[str]:
+        """What the repository-advisory pass covered, for reports."""
+        if self.repo_check is None:
+            return []
+        note = (
+            f"Repository advisories: checked {len(self.repo_check.repos_checked)} GitHub "
+            "repositories of shipped packages"
+        )
+        if self.repo_check.unmapped:
+            note += (
+                f"; {len(self.repo_check.unmapped)} packages declare no GitHub repository "
+                "and were not checked"
+            )
+        return [note]
 
 
 @dataclass

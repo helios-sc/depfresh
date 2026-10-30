@@ -209,6 +209,7 @@ class OnlineSources:
         self._headers = {"User-Agent": user_agent, "Accept": "application/json"}
         self._osv_cache: dict[tuple[str, str], list[dict[str, Any]]] = {}
         self._release_cache: dict[str, list[Release]] = {}
+        self._project_cache: dict[str, dict[str, Any]] = {}
 
     def _request(self, url: str, payload: dict[str, Any] | None = None) -> Any:
         data = json.dumps(payload).encode() if payload is not None else None
@@ -240,12 +241,27 @@ class OnlineSources:
         self._osv_cache[key] = records
         return records
 
+    def _project(self, package: str) -> dict[str, Any]:
+        name = normalise(package)
+        if name not in self._project_cache:
+            quoted = urllib.parse.quote(name)
+            data = self._request(f"{self._pypi_api}/pypi/{quoted}/json")
+            self._project_cache[name] = data if isinstance(data, dict) else {}
+        return self._project_cache[name]
+
+    def project_urls(self, package: str) -> list[str]:
+        """Home page and project URLs a package declares on PyPI."""
+        info = self._project(package).get("info") or {}
+        urls = [str(u) for u in (info.get("project_urls") or {}).values() if u]
+        if info.get("home_page"):
+            urls.append(str(info["home_page"]))
+        return urls
+
     def releases(self, package: str) -> list[Release]:
         name = normalise(package)
         if name in self._release_cache:
             return self._release_cache[name]
-        quoted = urllib.parse.quote(name)
-        data = self._request(f"{self._pypi_api}/pypi/{quoted}/json")
+        data = self._project(name)
         releases: list[Release] = []
         for raw_version, files in (data.get("releases") or {}).items():
             if not files:

@@ -352,3 +352,58 @@ class TestLogging:
         _setup_logging(verbose=False)
         logger = logging.getLogger("depfresh")
         assert logger.level == logging.INFO
+
+
+class TestNewFlags:
+    def _run(self, argv: list[str]) -> MagicMock:
+        mock_upgrade = MagicMock(return_value=_make_result())
+        with patch("depfresh.cli.upgrade", mock_upgrade):
+            try:
+                main(argv)
+            except SystemExit:
+                pass
+        return mock_upgrade
+
+    def test_defaults(self) -> None:
+        kwargs = self._run(["/p"]).call_args.kwargs
+        assert kwargs["strategy"] == "minimal"
+        assert kwargs["platform"] == "x86_64-unknown-linux-gnu"
+        assert kwargs["extras"] is None
+        assert kwargs["groups"] is None
+        assert kwargs["import_check"] is True
+        assert kwargs["repo_advisories"] is False
+        assert kwargs["uv_binary"] is None
+
+    def test_flags_reach_upgrade(self) -> None:
+        kwargs = self._run([
+            "/p", "--strategy", "latest", "--platform", "aarch64-unknown-linux-gnu",
+            "--extra", "full", "--extra", "gcs", "--group", "prod", "--all-extras",
+            "--all-groups", "--skip-import-check", "--repo-advisories", "--uv", "/opt/uv",
+        ]).call_args.kwargs
+        assert kwargs["strategy"] == "latest"
+        assert kwargs["platform"] == "aarch64-unknown-linux-gnu"
+        assert kwargs["extras"] == ["full", "gcs"]
+        assert kwargs["groups"] == ["prod"]
+        assert kwargs["all_extras"] is True and kwargs["all_groups"] is True
+        assert kwargs["import_check"] is False
+        assert kwargs["repo_advisories"] is True
+        assert kwargs["uv_binary"] == "/opt/uv"
+
+    def test_audit_only_calls_audit_only(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from depfresh.models import PlannedFix, Vulnerability
+
+        result = _make_result(
+            pre_audit_vulns=[Vulnerability("idna", "3.6", "CVE-1", "3.7", "")],
+            fixes=[PlannedFix("idna", "3.6", "3.7", "planned", "minor", "Upgrade to 3.7")],
+        )
+        with patch("depfresh.cli.audit_only", return_value=result) as mock:
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/p", "--audit-only", "--extra", "gcs"])
+        assert exc_info.value.code == 2
+        assert mock.call_args.kwargs["extras"] == ["gcs"]
+        assert "idna 3.6 -> 3.7 [planned]" in capsys.readouterr().out
+
+    def test_strategy_choices(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["/p", "--strategy", "everything"])
+        assert exc_info.value.code == 2
