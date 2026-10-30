@@ -35,6 +35,7 @@ The default remediation now audits and fixes what actually ships, and moves only
 ### Fixed
 
 - `[tool.uv.sources]` and `[[tool.uv.index]]` are honoured; a private-index package is never looked up on public PyPI, an unreachable private index fails the run, and requirements files that cannot pin a private package to its index are refused.
+- `--keep-version` packages are never moved as another fix's co-upgrade, in either mode, and resolved mode checks its first trial resolution for unapproved major co-upgrades too.
 - Raising a constraint for a fix keeps its upper bound and granularity: `~=2.31.0` and `==2.31.*` no longer become an unbounded `>=2.32.0`, a `<` cap moves only as far as the fix needs instead of to the next major, and epochs (`~=1!2.0`) are handled.
 - A non-PyPI default index (a mirror or proxy, `UV_INDEX_URL`) no longer makes every package private and the run clean with nothing audited: only packages pinned to an index with `[tool.uv.sources]`, or served by an explicit index, are private; the others are audited by name and the report names their index. The summary gives the audited and not-audited counts, never reports clean while packages went unaudited, and a run that audited nothing exits 2.
 - `setup.py` is never executed; local paths and archives in requirements files are treated as direct references instead of being built.

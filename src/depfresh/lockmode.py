@@ -48,8 +48,7 @@ from depfresh.remediation import (
     Auditor,
     ImportGate,
     RemediationOptions,
-    diff_sets,
-    disallowed_majors,
+    cobump_problem,
     plan,
 )
 from depfresh.uv import run, uv_env
@@ -770,11 +769,12 @@ def _apply_targets(
     snapshot_lock = project.lock_path.read_bytes()
     snapshot_pyproject = project.pyproject_path.read_bytes()
     ok, _ = project.lock_upgrade(targets)
-    if ok and not _disallowed_cobumps(project, baseline, targets, options):
+    if ok and not _cobump_problem(project, baseline, targets, options):
         return
     project.lock_path.write_bytes(snapshot_lock)
     project.pyproject_path.write_bytes(snapshot_pyproject)
-    log.info("Combined update failed or crossed an unapproved major; trying one at a time")
+    log.info("Combined update failed, crossed an unapproved major or moved a kept package; "
+             "trying one at a time")
     for name, version in sorted(targets.items()):
         _apply_one(project, name, version, baseline, options, failures, notes)
 
@@ -805,34 +805,31 @@ def _apply_one(
                     f"pyproject.toml: `{blocker}` excluded the fix {name} {version}, so the "
                     "constraint was raised"
                 )
+    problem = ""
     if ok:
-        majors = _disallowed_cobumps(project, baseline, {name: version}, options)
-        if not majors:
+        problem = _cobump_problem(project, baseline, {name: version}, options)
+        if not problem:
             return
-        output = "requires a major co-upgrade of " + ", ".join(
-            f"{c.name} {c.old_version}→{c.new_version}" for c in majors
-        ) + f"; re-run with --allow-major {name} " + " ".join(c.name for c in majors)
     project.lock_path.write_bytes(snapshot_lock)
     project.pyproject_path.write_bytes(snapshot_pyproject)
-    failures[name] = f"uv could not lock {name}=={version}: {_uv_failure_summary(output)}"
+    failures[name] = (f"{name}=={version} {problem}" if problem else
+                      f"uv could not lock {name}=={version}: {_uv_failure_summary(output)}")
     log.warning("%s", failures[name])
 
 
-def _disallowed_cobumps(
+def _cobump_problem(
     project: LockProject,
     baseline: ShippedSet,
     targets: dict[str, str],
     options: RemediationOptions,
-) -> list[PackageChange]:
-    """Packages other than *targets* that the update moved across a major version."""
+) -> str:
+    """Why the update cannot stand (see :func:`~depfresh.remediation.cobump_problem`)."""
     try:
         after = shipped_set(project.export(options), options.env,
                             read_lock(project.lock_path)[1], project.scope)
-    except CommandError:
-        return []
-    changed, _, _, _ = diff_sets(baseline.pins, after.pins, set())
-    others = [c for c in changed if c.name not in targets]
-    return disallowed_majors(others, options.allow_major)
+    except CommandError as exc:
+        return f"leaves a lock uv cannot export ({exc})"
+    return cobump_problem(baseline.pins, after.pins, targets, options)
 
 
 def _baseline_imports(

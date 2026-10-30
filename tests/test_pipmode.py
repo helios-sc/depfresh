@@ -453,6 +453,56 @@ class TestRemediatePip:
         assert outcome.new_text == "fastapi==0.133.0\nstarlette==1.3.1\n"
         assert outcome.final.pins == {"fastapi": "0.133.0", "starlette": "1.3.1"}
 
+    def test_a_kept_pin_is_never_co_upgraded(self, tmp_path: Path) -> None:
+        """Starlette's fix needs a newer FastAPI, which --keep-version keeps."""
+        resolver = FakeResolver(
+            {"fastapi": ["0.129.0", "0.133.0"], "starlette": ["0.52.1", "0.53.0"]},
+            {("fastapi", "0.129.0"): {"starlette": "<0.53"},
+             ("fastapi", "0.133.0"): {"starlette": ">=0.40,<1"}},
+        )
+        text = "fastapi==0.129.0\nstarlette==0.52.1\n"
+        outcome = _remediate(tmp_path, text, resolver, {"starlette": {"0.52.1"}},
+                             {"starlette": "0.53.0"}, keep_version=["fastapi"])
+        assert outcome.new_text == text
+        assert outcome.failures["starlette"].endswith("(--keep-version keeps fastapi)")
+        (tmp_path / "unkept").mkdir()
+        unkept = _remediate(tmp_path / "unkept", text, resolver, {"starlette": {"0.52.1"}},
+                            {"starlette": "0.53.0"})
+        assert unkept.new_text == "fastapi==0.133.0\nstarlette==0.53.0\n"
+
+    def test_a_kept_transitive_package_is_never_co_upgraded(self, tmp_path: Path) -> None:
+        resolver = FakeResolver(
+            {"aiohttp": ["3.14.1", "3.14.4"], "yarl": ["1.24.2", "1.25.1"]},
+            {("aiohttp", "3.14.1"): {"yarl": ">=1.24,<1.25"},
+             ("aiohttp", "3.14.4"): {"yarl": ">=1.25"}},
+        )
+        outcome = _remediate(tmp_path, "aiohttp==3.14.1\n", resolver, {"aiohttp": {"3.14.1"}},
+                             {"aiohttp": "3.14.4"}, keep_version=["yarl"])
+        assert outcome.new_text == "aiohttp==3.14.1\n"
+        assert "moves yarl 1.24.2→1.25.1, which --keep-version keeps" in (
+            outcome.failures["aiohttp"]
+        )
+
+    def test_the_first_trial_is_checked_for_majors(self, tmp_path: Path) -> None:
+        """The fix resolves at once but drags a transitive package across a major."""
+        resolver = FakeResolver(
+            {"aiohttp": ["3.14.1", "3.14.4"], "multidict": ["6.4.4", "7.0.0"]},
+            {("aiohttp", "3.14.1"): {"multidict": "<7"},
+             ("aiohttp", "3.14.4"): {"multidict": ">=7"}},
+        )
+        outcome = _remediate(tmp_path, "aiohttp==3.14.1\n", resolver, {"aiohttp": {"3.14.1"}},
+                             {"aiohttp": "3.14.4"})
+        assert outcome.new_text == "aiohttp==3.14.1\n"
+        assert outcome.failures["aiohttp"] == (
+            "Fixing aiohttp 3.14.4 requires a major co-upgrade of multidict 6.4.4→7.0.0; "
+            "re-run with --allow-major aiohttp multidict"
+        )
+        (tmp_path / "allowed").mkdir()
+        allowed = _remediate(tmp_path / "allowed", "aiohttp==3.14.1\n", resolver,
+                             {"aiohttp": {"3.14.1"}}, {"aiohttp": "3.14.4"},
+                             allow_major=["multidict"])
+        assert allowed.new_text == "aiohttp==3.14.4\n"
+
     def test_major_co_upgrade_needs_permission(self, tmp_path: Path) -> None:
         resolver = FakeResolver(
             {"pyopenssl": ["25.3.0", "26.4.0"], "cryptography": ["46.0.5", "46.0.7"]},

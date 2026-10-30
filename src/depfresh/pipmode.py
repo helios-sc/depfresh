@@ -53,8 +53,8 @@ from depfresh.remediation import (
     Auditor,
     ImportGate,
     RemediationOptions,
+    cobump_problem,
     diff_sets,
-    disallowed_majors,
     plan,
 )
 from depfresh.reqlines import (
@@ -979,30 +979,34 @@ def _plan_edits(
                 a[name] = (f"{op}{version}", f"depfresh: {advisory}")
         return e, a
 
-    candidate_edits, candidate_adds = edits_for(targets)
-    text = _render(fmt, original, options, candidate_edits, candidate_adds, ws)
-    try:
-        ws.compile(ws.write(text), preferences=current.text, lowest_direct=True)
-        edits.update(candidate_edits)
-        additions.update(candidate_adds)
-        return
-    except CommandError:
-        log.info("Pins in %s block the fixes; looking for minimal co-upgrades", ws.manifest_name)
+    def attempt(names: set[str]) -> str:
+        """Fix *names*: ``""`` when the edits are taken, otherwise why not."""
+        candidate_edits, candidate_adds = edits_for(names)
+        text = _render(fmt, original, options, candidate_edits, candidate_adds, ws)
+        try:
+            trial = ws.compile(ws.write(text), preferences=current.text, lowest_direct=True)
+        except CommandError:
+            log.info("Pins in %s block %s; looking for minimal co-upgrades", ws.manifest_name,
+                     ", ".join(sorted(names)))
+        else:
+            problem = cobump_problem(current.pins, trial.pins, names, options)
+            if not problem:
+                edits.update(candidate_edits)
+                additions.update(candidate_adds)
+                return ""
+            log.info("Fixing %s %s; looking for other co-upgrades",
+                     ", ".join(sorted(names)), problem)
+        label = ", ".join(f"{n} {targets[n]}" for n in sorted(names))
+        return _with_cobumps(ws, fmt, original, current, listed, names, candidate_edits,
+                             candidate_adds, options, edits, additions, label)
 
-    ok = _with_cobumps(ws, fmt, original, current, listed, set(targets), candidate_edits,
-                       candidate_adds, options, edits, additions)
-    if ok:
+    if not attempt(set(targets)):
         return
     for name in sorted(targets):
-        one_edits, one_adds = edits_for([name])
-        if _with_cobumps(ws, fmt, original, current, listed, {name}, one_edits, one_adds,
-                         options, edits, additions):
-            continue
-        failures[name] = (
-            f"No resolution fixes {name} {targets[name]} on {options.env.platform}: "
-            "the other requirements cannot move to a compatible version"
-        )
-        log.warning("%s", failures[name])
+        why = attempt({name})
+        if why:
+            failures[name] = why
+            log.warning("%s", why)
 
 
 def _is_pin(spec: str) -> bool:
@@ -1022,28 +1026,36 @@ def _with_cobumps(
     options: RemediationOptions,
     edits: dict[str, str],
     additions: dict[str, tuple[str, str]],
-) -> bool:
-    """Relax the other pins to floors, prefer every current version, take the lowest moves."""
+    label: str,
+) -> str:
+    """Relax the other pins to floors, prefer every current version, take the lowest moves.
+
+    Pins of ``--keep-version`` packages stay pinned.  *label* names the fixes
+    (``"starlette 0.53.0"``) in the reason.
+
+    Returns:
+        ``""`` when the edits are taken, otherwise why no co-upgrade works.
+    """
+    kept = {normalise(p) for p in options.keep_version or []}
     relaxed = dict(candidate_edits)
     for name, spec in listed.items():
-        if name not in relaxed and _is_pin(spec):
+        if name not in relaxed and _is_pin(spec) and name not in kept:
             relaxed[name] = f">={spec[2:]}"
     text = _render(fmt, original, options, relaxed, candidate_adds, ws)
     try:
         trial = ws.compile(ws.write(text), preferences=current.text, lowest_direct=True)
     except CommandError:
-        return False
+        pinned_kept = sorted(n for n in kept if n in listed and n not in fixing)
+        return (
+            f"No resolution fixes {label} on {options.env.platform}: the other requirements "
+            "cannot move to a compatible version"
+            + (f" (--keep-version keeps {', '.join(pinned_kept)})" if pinned_kept else "")
+        )
+    problem = cobump_problem(current.pins, trial.pins, fixing, options)
+    if problem:
+        return f"Fixing {label} {problem}"
     moved, _, _, _ = diff_sets(current.pins, trial.pins, set())
     cobumps = [c for c in moved if c.name not in fixing]
-    blocked = disallowed_majors(cobumps, options.allow_major)
-    if blocked:
-        log.warning(
-            "Fixing %s needs major co-upgrades (%s); re-run with --allow-major %s",
-            ", ".join(sorted(fixing)),
-            ", ".join(f"{c.name} {c.old_version}→{c.new_version}" for c in blocked),
-            " ".join(sorted(fixing | {c.name for c in blocked})),
-        )
-        return False
     new_edits = dict(candidate_edits)
     check_unambiguous(open_document(fmt, original, options), (c.name for c in cobumps))
     for change in cobumps:
@@ -1051,7 +1063,7 @@ def _with_cobumps(
             new_edits[change.name] = f"=={change.new_version}"
     edits.update(new_edits)
     additions.update(candidate_adds)
-    return True
+    return ""
 
 
 def _install_for_imports(

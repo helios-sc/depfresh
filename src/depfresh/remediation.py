@@ -200,6 +200,39 @@ def disallowed_majors(
     ]
 
 
+def cobump_problem(
+    before: Mapping[str, str],
+    after: Mapping[str, str],
+    fixing: Iterable[str],
+    options: RemediationOptions,
+) -> str:
+    """Why an update that fixes *fixing* cannot stand, or ``""`` when it can.
+
+    Packages other than *fixing* that moved (co-upgrades) must not be named by
+    ``--keep-version`` and must not cross a major that ``--allow-major`` does
+    not cover.  Both modes apply this to every trial, the first one included.
+    """
+    targets = {normalise(n) for n in fixing}
+    changed, _, _, _ = diff_sets(before, after, set())
+    others = [c for c in changed if c.name not in targets]
+    kept_names = {normalise(p) for p in options.keep_version or []}
+    kept = [c for c in others if c.name in kept_names]
+    majors = disallowed_majors([c for c in others if c.name not in kept_names],
+                               options.allow_major)
+    problems: list[str] = []
+    if kept:
+        problems.append(f"moves {_moves(kept)}, which --keep-version keeps")
+    if majors:
+        names = " ".join(sorted(targets | {c.name for c in majors}))
+        problems.append(f"requires a major co-upgrade of {_moves(majors)}; "
+                        f"re-run with --allow-major {names}")
+    return "; ".join(problems)
+
+
+def _moves(changes: Iterable[PackageChange]) -> str:
+    return ", ".join(f"{c.name} {c.old_version}→{c.new_version}" for c in changes)
+
+
 def planned_fixes(
     plans: Mapping[str, FixPlan],
     final: Mapping[str, str],

@@ -543,6 +543,21 @@ class TestRemediateLock:
         assert outcome.baseline.private == {"private-widget": "0.1.0"}
         assert outcome.pre_vulns == []
 
+    def test_a_kept_package_is_never_co_upgraded(self, tmp_path: Path) -> None:
+        auditor = FakeAuditor({"aiohttp": {"3.14.1"}})
+        sources = FakeSources({"aiohttp": "3.14.4"}, self.RELEASES)
+        outcome, project = _run(
+            tmp_path,
+            lambda root: FakeProject(root, self.BASE, {"aiohttp==3.14.4": {"yarl": "1.25.1"}},
+                                     PYPROJECT),
+            auditor, sources, keep_version=["yarl"],
+        )
+        assert outcome.final.pins == self.BASE
+        assert outcome.new_lock is None
+        assert outcome.failures["aiohttp"] == (
+            "aiohttp==3.14.4 moves yarl 1.24.2→1.25.1, which --keep-version keeps"
+        )
+
     def test_follow_up_round_for_a_vulnerable_co_upgrade(self, tmp_path: Path) -> None:
         auditor = FakeAuditor({"aiohttp": {"3.14.1"}, "yarl": {"1.24.9"}})
         sources = FakeSources({"aiohttp": "3.14.4", "yarl": "1.25.1"},

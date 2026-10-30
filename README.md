@@ -160,7 +160,7 @@ For each vulnerable package depfresh reads the full OSV records of its advisorie
 - in the current major when one exists; calendar versions (certifi, tzdata) never count as a major;
 - otherwise the package needs `--allow-major <pkg>`; without it the advisory stays open and the report says "Requires major upgrade (46→50). Use --allow-major cryptography";
 - an advisory with no fixed release, or one fixed only in a later major, stays open with its own reason and does not hold back the package's other fixes; when no single release fixes them all, the lowest release that fixes the most of them wins;
-- co-upgrades that cross a major are refused unless `--allow-major` covers them.
+- co-upgrades that cross a major are refused unless `--allow-major` covers them, and a `--keep-version` package never moves, not even as another fix's co-upgrade (the fix is then reported as blocked). Both rules apply to every trial resolution in both modes.
 
 Advisories are counted once: OSV's GHSA and PYSEC records of the same issue are merged by alias.
 
