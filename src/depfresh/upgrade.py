@@ -792,16 +792,28 @@ def _lock_result(
         manifest_diff=outcome.pyproject_diff,
     )
     result.remaining_reasons = remaining_reasons(result.post_audit_vulns, fixes)
+    if not files:
+        if outcome.lock_check.startswith("failed"):
+            result.notes.append(f"uv lock --check {outcome.lock_check} (nothing was changed)")
+        return result
     if gate.blocked:
-        result.write_back_skipped = gate.blocked
+        _withhold(result, gate.blocked)
     elif result.import_regressions:
-        result.write_back_skipped = (
+        _withhold(result, (
             f"{len(result.import_regressions)} import(s) resolved before the upgrade "
             "and fail after it"
-        )
+        ))
     elif outcome.lock_check.startswith("failed"):
-        result.write_back_skipped = f"uv lock --check {outcome.lock_check}"
+        _withhold(result, f"uv lock --check {outcome.lock_check}")
     return result
+
+
+def _withhold(result: UpgradeResult, reason: str) -> None:
+    """Record that nothing is written: the planned changes stay planned."""
+    result.write_back_skipped = reason
+    for fix in result.fixes:
+        if fix.status == "applied":
+            fix.status = "planned, not written"
 
 
 def _auditor(
@@ -949,17 +961,17 @@ def _pip_result(
         manifest_diff=diff,
     )
     result.remaining_reasons = remaining_reasons(result.post_audit_vulns, fixes)
+    if not outcome.changed:
+        return result
     if gate.blocked:
-        result.write_back_skipped = gate.blocked
+        _withhold(result, gate.blocked)
     elif result.import_regressions:
-        result.write_back_skipped = (
+        _withhold(result, (
             f"{len(result.import_regressions)} import(s) resolved before the upgrade "
             "and fail after it"
-        )
+        ))
     elif outcome.resolution_check.startswith("failed"):
-        result.write_back_skipped = (
-            f"the edited manifest does not resolve for {options.env.platform}"
-        )
+        _withhold(result, f"the edited manifest does not resolve for {options.env.platform}")
     return result
 
 
@@ -1099,7 +1111,7 @@ def _run_pip_mode(
             "Apply the versions under Security Fixes to install_requires by hand."
         ))
         if not audit_only_run and outcome.changed:
-            result.write_back_skipped = "setup.py is never edited"
+            _withhold(result, "setup.py is never edited; apply the planned versions by hand")
     if audit_only_run:
         return result
     if result.write_back_skipped:

@@ -285,11 +285,37 @@ def main(argv: list[str] | None = None) -> None:
             print(f"    {mod}: {err}")
         print("  The dependency file was not written.")
         sys.exit(3)
-    if result.post_audit_vulns:
-        print(f"\n  WARNING: {len(result.post_audit_vulns)} vulnerabilities remain.")
-        sys.exit(2)
-    else:
-        print("\n  All vulnerabilities resolved!")
+    code, lines = outcome_message(result)
+    print()
+    for line in lines:
+        print(f"  {line}")
+    if code:
+        sys.exit(code)
+
+
+def outcome_message(result: UpgradeResult) -> tuple[int, list[str]]:
+    """The exit code and closing lines for an upgrade run (import regressions aside).
+
+    The code describes the files on disk: when nothing was written (a dry run,
+    or a write-back withheld by a failed check) the vulnerabilities found before
+    the run are still there, so the run exits 2 if there were any.
+    """
+    before, after = len(result.pre_audit_vulns), len(result.post_audit_vulns)
+    if result.write_back_skipped:
+        return 2, [
+            f"NOTHING WAS WRITTEN: {result.write_back_skipped}.",
+            f"The files on disk still have the {before} vulnerabilities found before the "
+            f"run; the planned changes would have left {after}.",
+        ]
+    planned = bool(result.files_changed or result.manifest_diff)
+    if result.dry_run and planned:
+        return (2 if before else 0), [
+            f"DRY RUN: nothing was written. {before} vulnerabilities in the files on disk; "
+            f"the planned changes would leave {after}.",
+        ]
+    if after:
+        return 2, [f"WARNING: {after} vulnerabilities remain."]
+    return 0, ["All vulnerabilities resolved!"]
 
 
 def _print_audit(result: UpgradeResult) -> None:

@@ -310,6 +310,16 @@ def _md_summary(md: list[str], report: UpgradeResult) -> None:
         f"and **{len(report.post_audit_vulns)}** after the upgrade."
     )
     md.append("")
+    if report.write_back_skipped:
+        md.append(
+            f"**Nothing was written** ({report.write_back_skipped}): the files on disk still "
+            f"have the {len(report.pre_audit_vulns)} vulnerabilities found before the run, "
+            "and the changes below are planned only."
+        )
+        md.append("")
+    elif report.dry_run and (report.files_changed or report.manifest_diff):
+        md.append("**Dry run:** nothing was written; the changes below are planned only.")
+        md.append("")
     md.append("---")
     md.append("")
 

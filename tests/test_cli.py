@@ -407,3 +407,45 @@ class TestNewFlags:
         with pytest.raises(SystemExit) as exc_info:
             main(["/p", "--strategy", "everything"])
         assert exc_info.value.code == 2
+
+
+
+class TestNothingWritten:
+    """A withheld write-back is never reported as clean."""
+
+    def test_withheld_write_back_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from depfresh.models import Vulnerability
+
+        result = _make_result(
+            pre_audit_vulns=[Vulnerability("fastmcp", "3.4.2", "GHSA-x", "3.4.10", "")],
+            post_audit_vulns=[],
+            files_changed=["uv.lock"],
+            write_back_skipped="uv lock --check failed: stale",
+        )
+        with patch("depfresh.cli.upgrade", return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/p"])
+        assert exc_info.value.code == 2
+        out = capsys.readouterr().out
+        assert "NOTHING WAS WRITTEN: uv lock --check failed: stale." in out
+        assert "All vulnerabilities resolved" not in out
+
+    def test_dry_run_with_vulnerabilities_on_disk_exits_2(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from depfresh.models import Vulnerability
+
+        result = _make_result(
+            dry_run=True, files_changed=["requirements.txt"],
+            pre_audit_vulns=[Vulnerability("idna", "3.6", "CVE-1", "3.7", "")],
+        )
+        with patch("depfresh.cli.upgrade", return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/p", "--dry-run"])
+        assert exc_info.value.code == 2
+        assert "DRY RUN: nothing was written" in capsys.readouterr().out
+
+    def test_clean_dry_run_exits_0(self) -> None:
+        result = _make_result(dry_run=True)
+        with patch("depfresh.cli.upgrade", return_value=result):
+            main(["/p", "--dry-run"])  # must not raise

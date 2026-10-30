@@ -512,6 +512,49 @@ class TestUpgradeLockMode:
         assert (tmp_path / "proj" / "uv.lock").read_text() == "old lock\n"
         assert "uv lock --check" in result.write_back_skipped
 
+    @pytest.mark.parametrize("kind", ["lock check", "does not install"])
+    def test_withheld_rows_say_planned_not_written(self, tmp_path: Path, kind: str) -> None:
+        from depfresh.advisories import FixPlan
+
+        outcome = self._outcome(
+            tmp_path, lock_check="failed: stale" if kind == "lock check" else "passed",
+        )
+        if kind == "does not install":
+            outcome.gate.blocked = "the remediated lock does not install on this host"
+        outcome.plans = {"fastmcp": FixPlan(
+            "fastmcp", "3.4.2", outcome.pre_vulns, status="fix", target="3.4.10",
+            kind="patch", reason="Upgrade to 3.4.10",
+        )}
+        result = self._upgrade(tmp_path, outcome)
+        assert [f.status for f in result.fixes] == ["planned, not written"]
+        assert result.markdown_path is not None
+        assert "**Nothing was written**" in Path(result.markdown_path).read_text()
+
+    def test_withheld_write_back_exits_2_through_the_cli(
+        self, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from depfresh.cli import main
+
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "pyproject.toml").write_text(
+            '[project]\nname = "x"\nversion = "1"\ndependencies = ["fastmcp>=3.4.2"]\n'
+        )
+        (project / "uv.lock").write_text("old lock\n")
+        outcome = self._outcome(tmp_path, lock_check="failed: stale")
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.13.6"),
+            patch.object(_upgrade_mod, "install_pip_audit",
+                         return_value=("/tool/bin/python", "2.10.1")),
+            patch.object(_upgrade_mod, "remediate_lock", return_value=outcome),
+        ):
+            with pytest.raises(SystemExit) as exc_info:
+                main([str(project), "--reports-dir", str(tmp_path / "reports")])
+        assert exc_info.value.code == 2
+        assert "NOTHING WAS WRITTEN" in capsys.readouterr().out
+        assert (project / "uv.lock").read_text() == "old lock\n"
+
     def test_markdown_lists_lock_changes(self, tmp_path: Path) -> None:
         outcome = self._outcome(tmp_path)
         from depfresh.models import PackageChange
