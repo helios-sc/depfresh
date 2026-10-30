@@ -18,6 +18,7 @@ from depfresh.exceptions import (
 from depfresh.models import DependencySpec, ImportCheck, UpgradeResult, Vulnerability
 from depfresh.parsers import PyprojectPEP621Handler
 from depfresh.upgrade import (
+    _audit_only_legacy,
     _resolve_dep_file,
     _run_audit_with_temp,
     _setup_venv,
@@ -231,7 +232,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
-            result = upgrade(tmp_path, label="test", reports_dir=tmp_path)
+            result = upgrade(tmp_path, strategy="latest", label="test", reports_dir=tmp_path)
         assert isinstance(result, UpgradeResult)
         assert result.service_label == "test"
 
@@ -252,7 +253,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
-            upgrade(tmp_path, dry_run=True, label="test", reports_dir=tmp_path)
+            upgrade(tmp_path, strategy="latest", dry_run=True, label="test", reports_dir=tmp_path)
         assert req_file.read_text() == original_content
 
     def test_dry_run_reports_the_diff_it_would_write(
@@ -277,7 +278,9 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "write_log", return_value=tmp_path / "log.txt"),
             patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
         ):
-            result = upgrade(tmp_path, dry_run=True, label="test", reports_dir=tmp_path)
+            result = upgrade(
+                tmp_path, strategy="latest", dry_run=True, label="test", reports_dir=tmp_path,
+            )
         assert req_file.read_text() == original_content
         assert "-flask==2.3.0" in result.manifest_diff
         assert "+flask==2.3.3" in result.manifest_diff
@@ -300,7 +303,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
-            result = upgrade(tmp_path, label="test", reports_dir=tmp_path)
+            result = upgrade(tmp_path, strategy="latest", label="test", reports_dir=tmp_path)
         assert len(result.pre_audit_vulns) == 1
         assert result.pre_audit_vulns[0].cve == "CVE-2023-001"
 
@@ -318,7 +321,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "cleanup_venv") as mock_cleanup,
         ):
             with pytest.raises(RuntimeError, match="audit boom"):
-                upgrade(tmp_path, label="test", reports_dir=tmp_path)
+                upgrade(tmp_path, strategy="latest", label="test", reports_dir=tmp_path)
         mock_cleanup.assert_called_once()
 
     def test_post_vulns_appear_in_result(self, tmp_path: Path, req_file: Path) -> None:
@@ -338,7 +341,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
-            result = upgrade(tmp_path, label="test", reports_dir=tmp_path)
+            result = upgrade(tmp_path, strategy="latest", label="test", reports_dir=tmp_path)
         assert len(result.post_audit_vulns) == 1
         assert result.post_audit_vulns[0].cve == "CVE-2024-001"
 
@@ -361,7 +364,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
             with pytest.raises(CommandError, match="resolution failed"):
-                upgrade(tmp_path, label="test", reports_dir=tmp_path)
+                upgrade(tmp_path, strategy="latest", label="test", reports_dir=tmp_path)
 
         assert req_file.read_text() == original_content
 
@@ -388,7 +391,7 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
-            upgrade(tmp_path, label="test", reports_dir=tmp_path)
+            upgrade(tmp_path, strategy="latest", label="test", reports_dir=tmp_path)
 
         install_deps = setup_mock.call_args.args[5]
         old_pkgs = setup_mock.call_args.args[6]
@@ -420,7 +423,10 @@ class TestUpgradeHappyPath:
             patch.object(_upgrade_mod, "write_markdown", return_value=tmp_path / "pr.md"),
             patch.object(_upgrade_mod, "cleanup_venv"),
         ):
-            upgrade(tmp_path, label="test", reports_dir=tmp_path, dependency_scope="all")
+            upgrade(
+                tmp_path, strategy="latest", label="test", reports_dir=tmp_path,
+                dependency_scope="all",
+            )
 
         install_deps = setup_mock.call_args.args[5]
         old_pkgs = setup_mock.call_args.args[6]
@@ -453,6 +459,7 @@ class TestUpgradeHappyPath:
                 label="test",
                 reports_dir=tmp_path,
                 ignore_direct_references=True,
+                strategy="latest",
             )
 
         install_deps = setup_mock.call_args.args[5]
@@ -481,7 +488,7 @@ class TestImportRegressionGate:
         ):
             return upgrade(
                 tmp_path, label="test", reports_dir=tmp_path, dry_run=dry_run,
-                allow_major=[],
+                allow_major=[], strategy="latest",
             )
 
     def test_regression_blocks_write_back(self, tmp_path: Path) -> None:
@@ -528,39 +535,66 @@ class TestAuditOnly:
         with pytest.raises(RequirementsNotFoundError):
             audit_only(tmp_path)
 
+    @staticmethod
+    def _outcome(pins: dict[str, str], vulns: list[Vulnerability]) -> MagicMock:
+        from depfresh.pipmode import PipOutcome, Resolution
+        from depfresh.remediation import ImportGate
+
+        resolution = Resolution(pins=pins)
+        return MagicMock(return_value=PipOutcome(
+            baseline=resolution, final=resolution, pre_vulns=vulns, post_vulns=vulns,
+            plans={}, failures={}, new_text="", changed=False, resolution_check="",
+            commands=[], notes=[], not_audited=[], gate=ImportGate(False, Path(".")),
+            direct_refs=[],
+        ))
+
     def test_returns_upgrade_result(self, tmp_path: Path) -> None:
         (tmp_path / "requirements.txt").write_text("flask==2.3.0\n")
-        setup_mock = MagicMock(return_value=("/venv/bin/python", "3.11.5", {"flask": "2.3.0"}))
         with (
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
-            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
-            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.9.0"),
             patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
-            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[]),
-            patch.object(_upgrade_mod, "cleanup_venv"),
+            patch.object(_upgrade_mod, "remediate_pip",
+                         self._outcome({"flask": "2.3.0"}, [])) as mock,
         ):
             result = audit_only(tmp_path)
         assert isinstance(result, UpgradeResult)
         assert result.post_audit_vulns == []
+        assert result.mode == "requirements"
+        assert mock.call_args.kwargs["audit_only"] is True
 
     def test_vulnerabilities_placed_in_pre_audit_vulns(self, tmp_path: Path) -> None:
         """audit_only stores findings in pre_audit_vulns (no upgrade, no post)."""
         (tmp_path / "requirements.txt").write_text("urllib3==2.0.0\n")
         vuln = Vulnerability("urllib3", "2.0.0", "CVE-2023-001", "2.0.6", "desc")
-        setup_mock = MagicMock(return_value=("/venv/bin/python", "3.11.5", {"urllib3": "2.0.0"}))
         with (
             patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
-            patch.object(_upgrade_mod, "get_uv_version", return_value="0.4.0"),
-            patch.object(_upgrade_mod, "_setup_venv", setup_mock),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.9.0"),
             patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
-            patch.object(_upgrade_mod, "_run_audit_with_temp", return_value=[vuln]),
-            patch.object(_upgrade_mod, "cleanup_venv"),
+            patch.object(_upgrade_mod, "remediate_pip",
+                         self._outcome({"urllib3": "2.0.0"}, [vuln])),
         ):
             result = audit_only(tmp_path)
         assert len(result.pre_audit_vulns) == 1
         assert result.pre_audit_vulns[0].package == "urllib3"
+        assert result.post_audit_vulns == []
 
-    def test_cleanup_venv_called_even_on_error(self, tmp_path: Path) -> None:
+    def test_work_dir_removed_even_on_error(self, tmp_path: Path) -> None:
+        (tmp_path / "requirements.txt").write_text("flask==2.3.0\n")
+        work = tmp_path / "work"
+        work.mkdir()
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.9.0"),
+            patch.object(_upgrade_mod.tempfile, "mkdtemp", return_value=str(work)),
+            patch.object(_upgrade_mod, "install_pip_audit", return_value=_AUDIT_TOOL),
+            patch.object(_upgrade_mod, "remediate_pip", side_effect=RuntimeError("boom")),
+        ):
+            with pytest.raises(RuntimeError):
+                audit_only(tmp_path)
+        assert not work.exists()
+
+    def test_legacy_audit_cleans_up_on_error(self, tmp_path: Path) -> None:
         (tmp_path / "requirements.txt").write_text("flask==2.3.0\n")
         setup_mock = MagicMock(return_value=("/venv/bin/python", "3.11.5", {"flask": "2.3.0"}))
         with (
@@ -572,7 +606,10 @@ class TestAuditOnly:
             patch.object(_upgrade_mod, "cleanup_venv") as mock_cleanup,
         ):
             with pytest.raises(RuntimeError):
-                audit_only(tmp_path)
+                _audit_only_legacy(
+                    tmp_path, dep_file=None, fmt=None, python="3.11", venv_name=".venv-audit",
+                    dependency_scope="runtime", ignore_direct_references=False, uv_binary=None,
+                )
         mock_cleanup.assert_called_once()
 
     def test_pip_audit_runs_from_an_isolated_tool_env(self, tmp_path: Path) -> None:
@@ -604,7 +641,10 @@ class TestAuditOnly:
             patch.object(_upgrade_mod, "run", return_value=MagicMock(stdout="Python 3.11.5\n")),
             patch.object(_upgrade_mod, "_run_audit_with_temp", audit_mock),
         ):
-            audit_only(tmp_path)
+            _audit_only_legacy(
+                tmp_path, dep_file=None, fmt=None, python="3.11", venv_name=".venv-audit",
+                dependency_scope="runtime", ignore_direct_references=False, uv_binary=None,
+            )
 
         # The tool env lives in depfresh's work dir, not in the project venv.
         tool_dir = install_tool.call_args.args[1]
@@ -632,7 +672,7 @@ class TestAuditOnly:
             patch.object(_upgrade_mod, "install_requirements", side_effect=error),
         ):
             with pytest.raises(CommandError):
-                upgrade(tmp_path, label="test", reports_dir=tmp_path / "reports")
+                upgrade(tmp_path, strategy="latest", label="test", reports_dir=tmp_path / "reports")
 
         assert created, "venv should have been created before the failure"
         assert not created[0].exists()

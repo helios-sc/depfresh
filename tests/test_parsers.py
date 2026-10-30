@@ -263,6 +263,37 @@ class TestRequirementsSimple:
     def test_is_pinned(self) -> None:
         assert RequirementsSimpleHandler().is_pinned is True
 
+    def test_write_edits_existing_files_in_place(self, tmp_path: Path) -> None:
+        """No more whole-environment freeze: comments, floors and order survive."""
+        req = tmp_path / "requirements.txt"
+        req.write_text(dedent("""\
+            # pinned for the gRPC stack
+            grpcio==1.80.0  # with grpcio-status
+            docstring_parser==0.17.0
+            google-cloud-storage>=2.10.0
+            pywin32==306 ; sys_platform == "win32"
+        """))
+        RequirementsSimpleHandler().write(
+            {"grpcio": "1.84.1", "docstring-parser": "0.17.0", "google-cloud-storage": "3.17.1",
+             "pywin32": "306", "protobuf": "6.33.6"},
+            req,
+        )
+        assert req.read_text() == dedent("""\
+            # pinned for the gRPC stack
+            grpcio==1.84.1  # with grpcio-status
+            docstring_parser==0.17.0
+            google-cloud-storage>=2.10.0
+            pywin32==306 ; sys_platform == "win32"
+        """)
+
+    def test_write_raises_a_floor_only_when_it_excludes_the_version(
+        self, tmp_path: Path,
+    ) -> None:
+        req = tmp_path / "requirements.txt"
+        req.write_text("cryptography>=41,<47\n")
+        RequirementsSimpleHandler().write({"cryptography": "50.0.2"}, req)
+        assert req.read_text() == "cryptography>=50.0.2,<51\n"
+
 
 # ===================================================================
 # Requirements.txt (hashed) handler

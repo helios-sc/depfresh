@@ -261,3 +261,35 @@ class TestLiveLockAware:
             [uv, "lock", "--check"], cwd=project, capture_output=True, text=True, timeout=120,
         )
         assert check.returncode == 0, check.stderr
+
+
+@pytest.mark.skipif(not _has_uv(), reason="uv not installed")
+class TestLiveResolvedMode:
+    """Minimal mode on a requirements file, resolved for linux/x86_64."""
+
+    def test_moves_only_the_vulnerable_line(
+        self,
+        installed_venv: tuple[Path, str, str],
+        tmp_path: Path,
+    ) -> None:
+        _, _, depfresh_bin = installed_venv
+        project = tmp_path / "req_project"
+        project.mkdir()
+        original = "# service pins\nidna==3.6  # transitive of requests\nsix>=1.16\n"
+        (project / "requirements.txt").write_text(original)
+
+        result = subprocess.run(
+            [depfresh_bin, str(project), "--python", _PYTHON_VERSION,
+             "--reports-dir", str(tmp_path / "reports"), "--label", "smoke_resolved"],
+            capture_output=True, text=True, timeout=600,
+        )
+        assert result.returncode in (0, 2), (
+            f"STDOUT:\n{result.stdout}\nSTDERR:\n{result.stderr}"
+        )
+        assert "Target:       x86_64-unknown-linux-gnu" in result.stdout
+
+        lines = (project / "requirements.txt").read_text().splitlines()
+        assert lines[0] == "# service pins"
+        assert lines[1].startswith("idna==") and lines[1] != "idna==3.6  # transitive of requests"
+        assert lines[1].endswith("  # transitive of requests")
+        assert lines[2] == "six>=1.16"

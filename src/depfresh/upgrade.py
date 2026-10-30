@@ -20,7 +20,12 @@ from depfresh.constraints import (
     diagnose_remaining,
     normalise,
 )
-from depfresh.exceptions import DirectReferenceError, RequirementsNotFoundError, TargetNotFoundError
+from depfresh.exceptions import (
+    DepfreshError,
+    DirectReferenceError,
+    RequirementsNotFoundError,
+    TargetNotFoundError,
+)
 from depfresh.lockmode import LockOutcome, remediate_lock
 from depfresh.models import DependencyScope, DependencySpec, UpgradeResult, Vulnerability
 from depfresh.parsers import (
@@ -30,6 +35,7 @@ from depfresh.parsers import (
     detect_format,
     get_handler,
 )
+from depfresh.pipmode import PIP_FORMATS, PipOutcome, changes_of, remediate_pip
 from depfresh.remediation import (
     Auditor,
     RemediationOptions,
@@ -39,7 +45,7 @@ from depfresh.remediation import (
     remaining_reasons,
 )
 from depfresh.reports import write_log, write_markdown
-from depfresh.textio import decode_bytes, read_text_file
+from depfresh.textio import decode_bytes, read_text_file, write_text_like
 from depfresh.uv import (
     cleanup_venv,
     create_venv,
@@ -163,7 +169,12 @@ def _setup_venv(
             temp_install.unlink(missing_ok=True)
 
     resolved_pkgs = old_pkgs
-    if not handler.is_pinned:
+    exactly_pinned = all(
+        str(dep.requirement).split(";")[0].strip().endswith(f"=={dep.version}")
+        for dep in install_deps
+    )
+    if not handler.is_pinned or not exactly_pinned:
+        # A floor (>=2.10.0) is not the version that ships: read what was installed.
         resolved_pkgs = freeze(uv, venv_python)
         log.info("Resolved %d actual installed versions via freeze", len(resolved_pkgs))
 
@@ -824,6 +835,148 @@ def _run_lock_mode(
     return result
 
 
+
+def _pip_result(
+    outcome: PipOutcome,
+    *,
+    manifest: _Manifest,
+    options: RemediationOptions,
+    uv_version: str,
+    pip_audit_version: str,
+    service_label: str,
+    venv_name: str,
+    dependency_scope: DependencyScope,
+    ignore_direct_references: bool,
+    audit_only_run: bool,
+) -> UpgradeResult:
+    """Build the :class:`UpgradeResult` of a resolved-mode run (nothing written yet)."""
+    still = {normalise(v.package) for v in outcome.post_vulns}
+    changed, added, unchanged, removed = changes_of(outcome)
+    fixes = planned_fixes(
+        outcome.plans, outcome.final.pins, outcome.failures, still,
+        applied=not (options.dry_run or audit_only_run),
+    )
+    diff = ""
+    if outcome.changed:
+        diff = "".join(difflib.unified_diff(
+            outcome.baseline_text_lines(), outcome.new_text.splitlines(keepends=True),
+            fromfile=f"a/{manifest.path.name}", tofile=f"b/{manifest.path.name}",
+        ))
+    gate = outcome.gate
+    is_pyproject = manifest.fmt == DependencyFormat.PYPROJECT_PEP621
+    result = UpgradeResult(
+        date=datetime.date.today().isoformat(),
+        python_version=options.env.python_version,
+        uv_version=uv_version,
+        pip_audit_version=pip_audit_version,
+        requirements_path=str(manifest.path.relative_to(manifest.target_dir)),
+        venv_name=venv_name,
+        service_label=service_label,
+        dependency_scope=dependency_scope,
+        ignore_direct_references=ignore_direct_references,
+        allow_major=options.allow_major,
+        keep_version=options.keep_version,
+        dry_run=options.dry_run,
+        import_check=gate.after,
+        import_check_baseline=gate.baseline,
+        import_regressions=gate.regressions(),
+        pre_audit_vulns=outcome.pre_vulns,
+        post_audit_vulns=[] if audit_only_run else outcome.post_vulns,
+        direct_references_ignored=outcome.direct_refs if ignore_direct_references else [],
+        upgraded=changed,
+        new_deps=added,
+        unchanged=unchanged,
+        original_count=len(outcome.baseline.pins),
+        final_count=len(outcome.final.pins),
+        mode="pyproject" if is_pyproject else "requirements",
+        strategy="minimal",
+        platform=options.env.platform,
+        extras=(list(options.extras) or (["(all)"] if options.all_extras else []))
+        if is_pyproject else [],
+        fixes=fixes,
+        resolution_check=outcome.resolution_check,
+        not_audited=outcome.not_audited,
+        commands=outcome.commands,
+        files_changed=[str(manifest.path.relative_to(manifest.target_dir))]
+        if outcome.changed else [],
+        notes=[*outcome.notes, *gate.notes, *(f"Removed from the shipped set: {c.name} "
+                                              f"{c.old_version}" for c in removed)],
+        manifest_diff=diff,
+    )
+    result.remaining_reasons = remaining_reasons(result.post_audit_vulns, fixes)
+    if gate.blocked:
+        result.write_back_skipped = gate.blocked
+    elif result.import_regressions:
+        result.write_back_skipped = (
+            f"{len(result.import_regressions)} import(s) resolved before the upgrade "
+            "and fail after it"
+        )
+    elif outcome.resolution_check.startswith("failed"):
+        result.write_back_skipped = (
+            f"the edited manifest does not resolve for {options.env.platform}"
+        )
+    return result
+
+
+def _run_pip_mode(
+    manifest: _Manifest,
+    options: RemediationOptions,
+    *,
+    uv_binary: str | None,
+    service_label: str,
+    venv_name: str,
+    dependency_scope: DependencyScope,
+    ignore_direct_references: bool,
+    sources: AdvisorySources | None,
+    audit_only_run: bool,
+) -> UpgradeResult:
+    uv = find_uv(uv_binary)
+    uv_version = get_uv_version(uv)
+    log.info("depfresh — %s of %s, resolved for %s / Python %s (uv %s at %s)",
+             "audit" if audit_only_run else "minimal remediation", manifest.path,
+             options.env.platform, options.env.python_version, uv_version, uv)
+    work_dir = Path(tempfile.mkdtemp(prefix=f"depfresh-{_RUN_ID}-"))
+    try:
+        audit_python, pip_audit_version = install_pip_audit(
+            uv, work_dir / ".pip-audit-tool", options.env.python_minor,
+        )
+        outcome = remediate_pip(
+            uv=uv,
+            target_dir=manifest.target_dir,
+            manifest=manifest.path,
+            fmt=manifest.fmt,
+            work_dir=work_dir,
+            auditor=Auditor(audit_python, work_dir),
+            options=options,
+            sources=sources or default_sources(),
+            venv_name=venv_name,
+            ignore_direct_references=ignore_direct_references,
+            audit_only=audit_only_run,
+        )
+    finally:
+        shutil.rmtree(work_dir, ignore_errors=True)
+
+    result = _pip_result(
+        outcome, manifest=manifest, options=options, uv_version=uv_version,
+        pip_audit_version=pip_audit_version, service_label=service_label,
+        venv_name=venv_name, dependency_scope=dependency_scope,
+        ignore_direct_references=ignore_direct_references, audit_only_run=audit_only_run,
+    )
+    if audit_only_run:
+        return result
+    if result.write_back_skipped:
+        log.error("NOT writing %s: %s", manifest.path.name, result.write_back_skipped)
+    elif options.dry_run:
+        log.info("DRY RUN — %s NOT modified", manifest.path.name)
+    elif outcome.changed:
+        write_text_like(manifest.path, outcome.new_text, read_text_file(manifest.path))
+        result.dep_file_updated = True
+        log.info("UPDATED %s", manifest.path)
+    else:
+        log.info("Nothing to change in %s", manifest.path.name)
+    return result
+
+
 def upgrade(
     target: str | Path,
     *,
@@ -858,7 +1011,11 @@ def upgrade(
       is exported and audited, fixed with ``uv lock --upgrade-package
       <pkg>==<fix>``, re-exported and re-audited, and checked with ``uv lock
       --check``.  The write-back is the updated ``uv.lock``.
-    * other formats keep the ``latest`` workflow for now.
+    * **requirements files and pyproject.toml without a lock**: the manifest
+      is resolved with ``uv pip compile`` for the deploy *platform* and
+      *python*, audited, and only the affected lines are edited (pins moved,
+      floors raised, a commented floor added for a vulnerable transitive
+      package); the edited manifest is resolved again and re-audited.
 
     ``strategy="latest"`` upgrades every package to its newest release within
     the current major (or across it with *allow_major*).
@@ -956,8 +1113,34 @@ def upgrade(
         return result
 
     if strategy == "minimal":
-        log.info("Minimal remediation for %s arrives with resolved mode; using 'latest'",
-                 manifest.fmt.value)
+        if manifest.fmt in PIP_FORMATS:
+            # Validate the inputs before looking for uv: fail closed on direct references.
+            _select_dependencies(
+                manifest.handler, manifest.path, dependency_scope=dependency_scope,
+                ignore_direct_references=ignore_direct_references,
+            )
+        if manifest.fmt not in PIP_FORMATS:
+            raise DepfreshError(
+                f"The minimal strategy supports requirements files and PEP 621 pyproject.toml "
+                f"(with or without uv.lock), not {manifest.fmt.value}. Re-run with "
+                "--strategy latest to upgrade every package within its bounds."
+            )
+        service_label = label or derive_label(target_dir)
+        options = _options(
+            python=python, platform=platform, allow_major=allow_major,
+            keep_version=keep_version, dry_run=dry_run, import_check=import_check,
+            extras=extras, all_extras=all_extras, groups=groups, all_groups=all_groups,
+            dependency_scope=dependency_scope, manifest=manifest,
+        )
+        result = _run_pip_mode(
+            manifest, options, uv_binary=uv_binary, service_label=service_label,
+            venv_name=venv_name, dependency_scope=dependency_scope,
+            ignore_direct_references=ignore_direct_references, sources=sources,
+            audit_only_run=False,
+        )
+        _write_reports(result, _out_dir(reports_dir, service_label), result.date)
+        return result
+
     return _upgrade_latest(
         target_dir,
         label=label,
@@ -1012,6 +1195,19 @@ def audit_only(
         return _run_lock_mode(
             manifest, options, uv_binary=uv_binary, service_label=derive_label(target_dir),
             venv_name=venv_name, dependency_scope=dependency_scope, sources=sources,
+            audit_only_run=True,
+        )
+    if manifest.fmt in PIP_FORMATS:
+        options = _options(
+            python=python, platform=platform, allow_major=None, keep_version=None,
+            dry_run=True, import_check=False, extras=extras, all_extras=all_extras,
+            groups=groups, all_groups=all_groups, dependency_scope=dependency_scope,
+            manifest=manifest,
+        )
+        return _run_pip_mode(
+            manifest, options, uv_binary=uv_binary, service_label=derive_label(target_dir),
+            venv_name=venv_name, dependency_scope=dependency_scope,
+            ignore_direct_references=ignore_direct_references, sources=sources,
             audit_only_run=True,
         )
     return _audit_only_legacy(

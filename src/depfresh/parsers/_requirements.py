@@ -17,7 +17,7 @@ from depfresh.parsers._helpers import (
     _format_requirement,
     _update_specifier_string,
 )
-from depfresh.textio import TextFile, read_text, read_text_file, write_text_like
+from depfresh.textio import read_text, read_text_file, write_text_like
 
 log = logging.getLogger("depfresh")
 
@@ -41,10 +41,53 @@ class RequirementsSimpleHandler:
         return _inspect_requirements_file(path)
 
     def write(self, pkgs: dict[str, str], path: Path, **kwargs: Any) -> None:
-        lines = [name if ver == "*" else f"{name}=={ver}" for name, ver in sorted(pkgs.items())]
-        original = read_text_file(path) if path.exists() else TextFile("")
-        write_text_like(path, "\n".join(lines) + "\n", original)
-        log.debug("Wrote requirements: %s (%d packages)", path, len(lines))
+        """Update the listed requirements to the versions in *pkgs*, in place.
+
+        Only lines of packages in *pkgs* whose version changes are touched: a
+        pin moves (``==``), a floor is raised (``>=``); comments, markers,
+        ordering, unlisted packages and every other line stay as they are.
+        A file that does not exist yet is written as sorted ``name==version``
+        lines.
+        """
+        if not path.exists():
+            lines = [name if ver == "*" else f"{name}=={ver}" for name, ver in sorted(pkgs.items())]
+            path.write_text("\n".join(lines) + "\n")
+            log.debug("Wrote requirements: %s (%d packages)", path, len(lines))
+            return
+        from depfresh.constraints import admit_version
+        from depfresh.pipmode import RequirementsDocument
+
+        original = read_text_file(path)
+        doc = RequirementsDocument(original.text)
+        changed = 0
+        for name, spec in doc.listed().items():
+            new_ver = pkgs.get(name)
+            if not new_ver or new_ver == "*":
+                continue
+            pinned = spec.startswith("==") and "," not in spec and "*" not in spec
+            if pinned:
+                if spec[2:] == new_ver:
+                    continue
+                new_spec = f"=={new_ver}"
+            elif _admits(spec, new_ver):
+                continue  # a floor that already admits the version is left alone
+            else:
+                new_spec = admit_version(spec, new_ver)
+            doc.set_spec(name, new_spec)
+            changed += 1
+        write_text_like(path, doc.render(), original)
+        log.debug("Updated %d requirement line(s) in %s", changed, path)
+
+
+def _admits(spec: str, version: str) -> bool:
+    """True when the specifier *spec* already allows *version*."""
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from packaging.version import InvalidVersion
+
+    try:
+        return SpecifierSet(spec).contains(version, prereleases=True)
+    except (InvalidSpecifier, InvalidVersion):
+        return True
 
 
 # ---------------------------------------------------------------------------
