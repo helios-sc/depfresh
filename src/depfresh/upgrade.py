@@ -7,10 +7,16 @@ import difflib
 import logging
 import os
 import shutil
+import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Literal, cast
+
+if sys.version_info >= (3, 11):
+    import tomllib
+else:
+    import tomli as tomllib  # type: ignore[import-not-found]
 
 from depfresh.advisories import DEFAULT_PLATFORM, AdvisorySources, TargetEnv
 from depfresh.audit import install_pip_audit, run_audit, write_pinned_requirements
@@ -32,7 +38,7 @@ from depfresh.indexes import (
     foreign_sources,
     uv_source_indexes,
 )
-from depfresh.lockmode import LockOutcome, remediate_lock
+from depfresh.lockmode import LockOutcome, check_static_project, remediate_lock
 from depfresh.models import DependencyScope, DependencySpec, UpgradeResult, Vulnerability
 from depfresh.parsers import (
     DependencyFormat,
@@ -42,7 +48,14 @@ from depfresh.parsers import (
     detect_format,
     get_handler,
 )
-from depfresh.pipmode import PIP_FORMATS, PipOutcome, changes_of, remediate_pip
+from depfresh.pipmode import (
+    PIP_FORMATS,
+    PipOutcome,
+    changes_of,
+    local_sources,
+    remediate_pip,
+    source_direct_refs,
+)
 from depfresh.remediation import (
     Auditor,
     RemediationOptions,
@@ -53,6 +66,7 @@ from depfresh.remediation import (
 )
 from depfresh.repoadvisories import ProjectUrls, RepoAdvisoryChecker
 from depfresh.reports import write_log, write_markdown
+from depfresh.reqlines import inspect_tree
 from depfresh.textio import decode_bytes, read_text_file, write_text_like
 from depfresh.uv import (
     cleanup_venv,
@@ -281,21 +295,20 @@ def _prepare_run(
     uv_version = get_uv_version(uv)
     log.info("Using uv %s at %s", uv_version, uv)
 
-    use_original_requirements = (
-        dep_format in (
-            DependencyFormat.REQUIREMENTS_SIMPLE,
-            DependencyFormat.REQUIREMENTS_HASHED,
-            DependencyFormat.REQUIREMENTS_IN,
-        )
-        and not ignored_direct_refs
-        # uv reads requirements files as UTF-8; a UTF-16 file goes through
-        # the synthesized install file instead.
-        and read_text_file(req_path).is_utf8
-    )
+    use_original_requirements = dep_format in _REQUIREMENTS_FORMATS
 
     work_dir = Path(tempfile.mkdtemp(prefix=f"depfresh-{_RUN_ID}-"))
     venv_path = work_dir / venv_name
     try:
+        install_path = req_path
+        if use_original_requirements:
+            # uv installs a mirrored copy of the file and its includes (UTF-8, every
+            # direct line refused or, with --ignore-direct-references, dropped), never
+            # the target's own files.
+            tree = inspect_tree(req_path, target_dir)
+            if tree.direct and not ignore_direct_references:
+                raise DirectReferenceError(str(req_path), tree.direct)
+            install_path = tree.copy_to(work_dir / "manifest", strip=True)
         venv_python, actual_py_version, old_pkgs = _setup_venv(
             uv,
             work_dir,
@@ -304,7 +317,7 @@ def _prepare_run(
             handler,
             install_deps,
             old_pkgs,
-            req_path,
+            install_path,
             use_original_requirements,
         )
         audit_python, pip_audit_version = install_pip_audit(
@@ -950,27 +963,63 @@ def _pip_result(
     return result
 
 
-def _check_private_sources(manifest: _Manifest) -> None:
-    """Requirements files cannot pin a package to the private index uv.sources names."""
-    if manifest.fmt in (
-        DependencyFormat.REQUIREMENTS_SIMPLE,
-        DependencyFormat.REQUIREMENTS_HASHED,
-        DependencyFormat.REQUIREMENTS_IN,
-        DependencyFormat.SETUP_PY,
-    ):
+_REQUIREMENTS_FORMATS = (
+    DependencyFormat.REQUIREMENTS_SIMPLE,
+    DependencyFormat.REQUIREMENTS_HASHED,
+    DependencyFormat.REQUIREMENTS_IN,
+)
+
+
+def _validate_inputs(
+    manifest: _Manifest, *, ignore_direct_references: bool, dependency_scope: DependencyScope,
+) -> None:
+    """Fail closed before uv is even located.
+
+    * requirements files: every line of the file and of every file it
+      includes; any path, archive, VCS, URL or editable line is refused
+      (unless --ignore-direct-references drops it), and so is a name that
+      ``[tool.uv.sources]`` pins to a private index;
+    * ``setup.py``: its static requirements, the same way;
+    * ``pyproject.toml`` without a lock: ``name @ url`` requirements and
+      names ``[tool.uv.sources]`` maps to a path, workspace, VCS or URL;
+    * uv projects: every project uv would have to build to lock (see
+      :func:`depfresh.lockmode.check_static_project`).
+    """
+    if manifest.fmt in _REQUIREMENTS_FORMATS:
+        tree = inspect_tree(manifest.path, manifest.target_dir)
+        if tree.direct and not ignore_direct_references:
+            raise DirectReferenceError(str(manifest.path), tree.direct)
+        check_requirements_against_sources(tree.registry, manifest.target_dir, manifest.path.name)
+    elif manifest.fmt == DependencyFormat.SETUP_PY:
+        _select_dependencies(
+            manifest.handler, manifest.path, dependency_scope=dependency_scope,
+            ignore_direct_references=ignore_direct_references,
+        )
         listed = set(manifest.handler.parse(manifest.path))
         check_requirements_against_sources(listed, manifest.target_dir, manifest.path.name)
+    elif manifest.is_uv_lock_project:
+        check_static_project(manifest.path.parent)
+    elif manifest.fmt == DependencyFormat.PYPROJECT_PEP621:
+        selected, _, _ = _select_dependencies(
+            manifest.handler, manifest.path, dependency_scope=dependency_scope,
+            ignore_direct_references=ignore_direct_references,
+        )
+        refs = source_direct_refs(manifest.path, {dep.name: "" for dep in selected})
+        if refs and not ignore_direct_references:
+            raise DirectReferenceError(str(manifest.path), refs)
 
 
 def _check_latest_sources(manifest: _Manifest) -> None:
-    """The latest strategy installs a synthesized file: it cannot honour private indexes."""
+    """The latest strategy installs a synthesized file: it cannot honour package sources."""
     if manifest.fmt == DependencyFormat.PYPROJECT_PEP621:
-        pinned = uv_source_indexes(manifest.path)
+        pinned = sorted(set(uv_source_indexes(manifest.path)) | set(
+            local_sources(tomllib.loads(manifest.path.read_text(encoding="utf-8")))
+        ))
         if pinned:
             raise PrivateSourceError(
-                f"{manifest.path.name} pins {', '.join(sorted(pinned))} to a private index "
+                f"{manifest.path.name} maps {', '.join(pinned)} to their own sources "
                 "([tool.uv.sources]); --strategy latest installs a synthesized requirements "
-                "file that cannot honour it and would look the names up on public PyPI. "
+                "file that cannot honour them and would look the names up on public PyPI. "
                 "Use the default minimal strategy, which runs uv on the project itself."
             )
     elif manifest.fmt in (DependencyFormat.PYPROJECT_POETRY, DependencyFormat.PIPFILE):
@@ -981,8 +1030,6 @@ def _check_latest_sources(manifest: _Manifest) -> None:
                 f"({', '.join(foreign)}); depfresh cannot honour them for this format and "
                 "will not resolve those packages against public PyPI."
             )
-    else:
-        _check_private_sources(manifest)
 
 
 def _setup_py_manifest(manifest: _Manifest, work_dir: Path, options: RemediationOptions) -> Path:
@@ -1190,6 +1237,10 @@ def upgrade(
     if not target_dir.is_dir():
         raise TargetNotFoundError(str(target_dir))
     manifest = _resolve_manifest(target_dir, dep_file, fmt)
+    _validate_inputs(
+        manifest, ignore_direct_references=ignore_direct_references,
+        dependency_scope=dependency_scope,
+    )
 
     if strategy == "minimal" and manifest.is_uv_lock_project:
         service_label = label or derive_label(target_dir)
@@ -1208,14 +1259,6 @@ def upgrade(
         return result
 
     if strategy == "minimal":
-        if manifest.fmt in (*PIP_FORMATS, DependencyFormat.SETUP_PY):
-            # Validate the inputs before looking for uv: fail closed on direct references
-            # and on packages a requirements file cannot pin to their private index.
-            _select_dependencies(
-                manifest.handler, manifest.path, dependency_scope=dependency_scope,
-                ignore_direct_references=ignore_direct_references,
-            )
-            _check_private_sources(manifest)
         if manifest.fmt not in (*PIP_FORMATS, DependencyFormat.SETUP_PY):
             raise DepfreshError(
                 f"The minimal strategy supports requirements files, PEP 621 pyproject.toml "
@@ -1284,6 +1327,10 @@ def audit_only(
     if not target_dir.is_dir():
         raise TargetNotFoundError(str(target_dir))
     manifest = _resolve_manifest(target_dir, dep_file, fmt)
+    _validate_inputs(
+        manifest, ignore_direct_references=ignore_direct_references,
+        dependency_scope=dependency_scope,
+    )
     if manifest.is_uv_lock_project:
         options = _options(
             python=python, platform=platform, allow_major=None, keep_version=None,
@@ -1297,7 +1344,6 @@ def audit_only(
             audit_only_run=True, repo_advisories=repo_advisories,
         )
     if manifest.fmt in (*PIP_FORMATS, DependencyFormat.SETUP_PY):
-        _check_private_sources(manifest)
         options = _options(
             python=python, platform=platform, allow_major=None, keep_version=None,
             dry_run=True, import_check=False, extras=extras, all_extras=all_extras,

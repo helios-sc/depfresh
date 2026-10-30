@@ -186,97 +186,56 @@ class RequirementsInHandler:
 # ---------------------------------------------------------------------------
 
 _PIP_DIRECTIVE_PATTERNS: dict[str, str] = {
-    "-r ": "File inclusion (-r) is not followed \u2014 "
-           "dependencies from the referenced file will not be processed",
-    "--requirement ": "File inclusion (--requirement) is not followed \u2014 "
-                      "dependencies from the referenced file will not be processed",
-    "-c ": "Constraint file (-c) is not applied \u2014 "
-           "constraints from the referenced file will not be enforced",
-    "--constraint ": "Constraint file (--constraint) is not applied \u2014 "
-                     "constraints from the referenced file will not be enforced",
-    "--index-url ": "Custom index (--index-url) is ignored \u2014 "
-                    "depfresh uses the default PyPI index (or uv\u2019s configured index)",
-    "--extra-index-url ": "Extra index (--extra-index-url) is ignored \u2014 "
-                          "packages from this index may not be found",
-    "--find-links ": "Find-links directive is ignored",
-    "--trusted-host ": "Trusted-host directive is ignored",
-    "--no-binary ": "no-binary directive is ignored",
-    "--only-binary ": "only-binary directive is ignored",
+    "-r ": "Included file (-r): this reader lists only this file's own requirements; "
+           "depfresh inspects the included file before uv resolves it",
+    "--requirement ": "Included file (--requirement): this reader lists only this file's own "
+                      "requirements; depfresh inspects the included file before uv resolves it",
+    "-c ": "Constraint file (-c): depfresh inspects it, and uv applies it when resolving",
+    "--constraint ": "Constraint file (--constraint): depfresh inspects it, and uv applies it "
+                     "when resolving",
+    "--index-url ": "Custom index (--index-url): uv resolves against it; packages from it "
+                    "are audited as public packages",
+    "--extra-index-url ": "Extra index (--extra-index-url): uv also resolves against it; "
+                          "packages from it are audited as public packages",
+    "--trusted-host ": "Trusted-host directive is passed to uv unchanged",
+    "--no-binary ": "no-binary directive is passed to uv unchanged",
+    "--only-binary ": "only-binary directive is passed to uv unchanged",
 }
 
 
 def _inspect_requirements_file(path: Path) -> DependencyInspection:
-    """Inspect a requirements-style file line-by-line."""
-    inspection = DependencyInspection()
-    lines = _merge_continuation_lines(read_text(path).splitlines())
+    """Inspect a requirements-style file, classifying every line like pip does.
 
-    for stripped in lines:
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith(("-e ", "--editable ", "git+")):
+    Lines uv would fetch from a path, archive, VCS or URL (and lines that do
+    not parse) are direct references.  Included files are not listed here;
+    :func:`depfresh.reqlines.inspect_tree` follows them.
+    """
+    from depfresh.reqlines import parse_lines
+
+    inspection = DependencyInspection()
+    for line in parse_lines(read_text(path)):
+        if line.kind == "direct":
             inspection.direct_references.append(DependencySpec(
-                name="",
-                version="",
-                requirement="",
-                raw=stripped,
-                source_kind="direct-reference",
-                group="runtime",
-                is_runtime=True,
-            ))
-            continue
-        if stripped.startswith("-"):
-            _warn_pip_directive(stripped, path)
-            continue
-        base = stripped.split(" --hash=", 1)[0].strip()
-        if not base or base.startswith("--hash="):
-            continue
-        if _looks_like_path_or_url(base):
-            # uv would build a local path or download an archive: never silently
-            inspection.direct_references.append(DependencySpec(
-                name="", version="", requirement="", raw=base,
+                name="", version="", requirement="", raw=line.requirement or line.code,
                 source_kind="direct-reference", group="runtime", is_runtime=True,
             ))
-            continue
-        try:
-            req = Requirement(base)
-        except InvalidRequirement:
-            continue
-        dep = _dependency_from_requirement(
-            req,
-            raw=base,
-            group="runtime",
-            is_runtime=True,
-        )
-        if dep.source_kind == "direct-reference":
-            inspection.direct_references.append(dep)
-        else:
-            inspection.registry.append(dep)
+        elif line.kind in ("option", "include"):
+            _warn_pip_directive(line.code, path)
+        elif line.kind == "registry":
+            req = Requirement(line.requirement)
+            inspection.registry.append(_dependency_from_requirement(
+                req, raw=line.requirement, group="runtime", is_runtime=True,
+            ))
     return inspection
 
 
-_ARCHIVE_SUFFIXES = (".whl", ".tar.gz", ".tgz", ".zip", ".tar.bz2")
-
-
-def _looks_like_path_or_url(line: str) -> bool:
-    """Requirement lines that name a path, an archive or a URL instead of a project."""
-    first = line.split(";", 1)[0].split(" #", 1)[0].strip()
-    if " @ " in first or first.startswith(("git+", "hg+", "svn+", "bzr+")):
-        return False  # PEP 508 direct references are classified by packaging
-    return (
-        first.startswith((".", "/", "~", "file:", "\\"))
-        or "://" in first
-        or first.endswith(_ARCHIVE_SUFFIXES)
-        or (len(first) > 2 and first[1] == ":" and first[2] in "\\/")
-    )
-
-
 def _warn_pip_directive(line: str, path: Path) -> None:
-    """Emit a warning when a pip directive is silently skipped."""
+    """Emit a warning for pip directives whose handling is worth knowing."""
     for prefix, message in _PIP_DIRECTIVE_PATTERNS.items():
         if line.startswith(prefix) or line.startswith("-" + prefix.lstrip("-")):
             log.warning("%s: %s: %s", path.name, message, line)
             return
-    log.debug("%s: skipping unsupported pip option: %s", path.name, line)
+    log.debug("%s: pip option passed to uv: %s", path.name, line)
 
 
 def _merge_continuation_lines(raw_lines: list[str]) -> list[str]:

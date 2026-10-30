@@ -245,9 +245,11 @@ class LockProject:
         self.root = work_dir / "project"
         self.commands: list[str] = []
         pyproject = tomllib.loads((target_dir / "pyproject.toml").read_text(encoding="utf-8"))
-        check_static_dependencies(pyproject, target_dir / "pyproject.toml")
-        if _needs_full_copy(pyproject):
+        full_copy = _needs_full_copy(pyproject)
+        if full_copy:
             self._check_paths_inside(pyproject)
+        check_static_project(target_dir)
+        if full_copy:
             shutil.copytree(target_dir, self.root, ignore=_COPY_IGNORE, symlinks=True)
         else:
             self.root.mkdir(parents=True)
@@ -325,20 +327,90 @@ class LockProject:
         return self.root / "pyproject.toml"
 
 
-def check_static_dependencies(pyproject: dict[str, Any], path: Path) -> None:
-    """Refuse projects whose dependencies only a build backend can compute.
+def check_static_dependencies(
+    pyproject: dict[str, Any], path: Path, fields: tuple[str, ...] = (
+        "dependencies", "optional-dependencies",
+    ),
+) -> None:
+    """Refuse projects whose metadata only a build backend can compute.
 
     uv would run the build backend (repository code, e.g. ``setup.py``) to
     learn them; depfresh never executes repository code.
     """
     dynamic = pyproject.get("project", {}).get("dynamic") or []
-    blocked = sorted({"dependencies", "optional-dependencies"} & {str(d) for d in dynamic})
+    blocked = sorted(set(fields) & {str(d) for d in dynamic})
     if blocked:
         raise DepfreshError(
             f"{path}: {', '.join(blocked)} are dynamic, so uv would have to run the build "
             "backend (repository code) to read them. depfresh never executes repository "
             "code; declare them statically in [project]."
         )
+
+
+#: What ``uv lock`` needs statically to avoid building a project: with a
+#: dynamic version it runs the build backend even for ``package = false``.
+_LOCK_STATIC_FIELDS = ("version", "dependencies", "optional-dependencies")
+
+
+def check_static_project(project_dir: Path) -> None:
+    """Refuse a uv project that ``uv lock`` would have to build.
+
+    Checks the project, every workspace member and every path dependency
+    (``[tool.uv.sources] x = { path = … }``): each must declare a static
+    ``[project]`` name, version and dependencies in ``pyproject.toml``.  A
+    directory with only ``setup.py``/``setup.cfg`` is refused, a wheel is fine
+    and any other archive is refused.
+
+    Raises:
+        DepfreshError: For the first project that is not static.
+    """
+    seen: set[Path] = set()
+    pending = [project_dir.resolve()]
+    while pending:
+        directory = pending.pop()
+        if directory in seen:
+            continue
+        seen.add(directory)
+        pyproject_path = directory / "pyproject.toml"
+        if not pyproject_path.is_file():
+            raise DepfreshError(
+                f"{directory}: no pyproject.toml, so uv would build the package (running "
+                "setup.py) to lock it; depfresh never executes repository code"
+            )
+        data = tomllib.loads(pyproject_path.read_text(encoding="utf-8"))
+        if "project" not in data:
+            raise DepfreshError(
+                f"{pyproject_path}: no [project] table, so uv would build the package to "
+                "lock it; depfresh never executes repository code"
+            )
+        check_static_dependencies(data, pyproject_path, _LOCK_STATIC_FIELDS)
+        tool_uv = data.get("tool", {}).get("uv", {})
+        workspace = tool_uv.get("workspace") or {}
+        excluded: set[Path] = set()
+        for pattern in workspace.get("exclude", []) or []:
+            excluded.update(p.resolve() for p in directory.glob(str(pattern)))
+        for pattern in workspace.get("members", []) or []:
+            for member in sorted(directory.glob(str(pattern))):
+                if member.is_dir() and member.resolve() not in excluded:
+                    pending.append(member.resolve())
+        for name, source in (tool_uv.get("sources") or {}).items():
+            entries = source if isinstance(source, list) else [source]
+            for entry in entries:
+                if not isinstance(entry, dict) or "path" not in entry:
+                    continue
+                target = (directory / str(entry["path"])).resolve()
+                if not target.exists():
+                    raise DepfreshError(
+                        f"{pyproject_path}: path dependency {name} ({entry['path']}) does not exist"
+                    )
+                if target.is_dir():
+                    pending.append(target)
+                elif target.suffix != ".whl":
+                    raise DepfreshError(
+                        f"{pyproject_path}: {name} is a local archive ({entry['path']}); uv "
+                        "would build it to lock the project, and depfresh never executes "
+                        "repository code"
+                    )
 
 
 def _first_error_line(text: str) -> str:

@@ -56,6 +56,12 @@ from depfresh.remediation import (
     disallowed_majors,
     plan,
 )
+from depfresh.reqlines import (
+    RequirementsTree,
+    check_no_direct_references,
+    inspect_tree,
+    parse_lines,
+)
 from depfresh.textio import TextFile, read_text_file
 from depfresh.uv import create_venv, run, uv_env
 
@@ -68,9 +74,7 @@ PIP_FORMATS = (
     DependencyFormat.PYPROJECT_PEP621,
 )
 
-_INCLUDE = re.compile(r"^\s*(?:-r|--requirement|-c|--constraint)(?:\s+|=)(\S+)")
 _NAME = re.compile(r"^\s*([A-Za-z0-9](?:[A-Za-z0-9._-]*[A-Za-z0-9])?)\s*(\[[^\]]*\])?")
-_LOCAL_PATH = re.compile(r"^\s*(?:\.{1,2}[/\\]|/|file:|[A-Za-z]:\\)")
 
 
 # ---------------------------------------------------------------------------
@@ -208,35 +212,21 @@ class RequirementsDocument:
         self._parse()
 
     def _parse(self) -> None:
-        i = 0
-        while i < len(self.lines):
-            start = i
-            while self.lines[i].rstrip("\r\n").rstrip().endswith("\\") and i + 1 < len(self.lines):
-                i += 1
-            end = i
-            i += 1
-            first = self.lines[start]
-            logical = " ".join(line.rstrip("\r\n") for line in self.lines[start:end + 1])
+        for line in parse_lines("".join(self.lines)):
+            if line.kind == "direct":
+                self.direct_refs.append(line.requirement or line.code)
+                continue
+            if line.kind != "registry":
+                continue
+            first = self.lines[line.start]
             code = _code_part(first)
-            stripped = code.strip()
-            if not stripped or stripped.startswith("-") or first.lstrip().startswith("#"):
-                if stripped.startswith(("-e ", "--editable")):
-                    self.direct_refs.append(stripped)
-                continue
-            if _LOCAL_PATH.match(stripped) or "://" in stripped and "@" not in stripped:
-                self.direct_refs.append(stripped)
-                continue
             split = split_requirement(code)
             if split is None:
-                self.direct_refs.append(stripped)
-                continue
-            try:
-                Requirement(stripped)
-            except InvalidRequirement:
                 continue
             name, s, e = split
+            logical = " ".join(x.rstrip("\r\n") for x in self.lines[line.start:line.end + 1])
             self.entries.setdefault(normalise(name), _Entry(
-                start, end, normalise(name), code[s:e], (s, e), "--hash" in logical,
+                line.start, line.end, normalise(name), code[s:e], (s, e), "--hash" in logical,
             ))
 
     def listed(self) -> dict[str, str]:
@@ -358,19 +348,53 @@ class PyprojectDocument:
 
 
 def strip_pyproject_direct_refs(text: str) -> str:
-    """Drop ``name @ url`` requirements from every dependency list (--ignore-direct-references)."""
+    """Drop direct requirements from every dependency list (--ignore-direct-references).
+
+    Direct means ``name @ url``, or a name ``[tool.uv.sources]`` maps to a
+    path, workspace member, VCS repository or URL.
+    """
     doc = tomlkit.parse(text)
+    sourced = set(local_sources(doc.unwrap()))
     project: Any = doc.get("project", {})
     arrays = [project["dependencies"]] if "dependencies" in project else []
     arrays += list((project.get("optional-dependencies") or {}).values())
     for array in arrays:
         for i in reversed(range(len(array))):
             try:
-                if Requirement(str(array[i])).url:
-                    del array[i]
+                req = Requirement(str(array[i]))
             except InvalidRequirement:
                 continue
+            if req.url or normalise(req.name) in sourced:
+                del array[i]
     return tomlkit.dumps(doc)
+
+
+def local_sources(pyproject: dict[str, Any]) -> dict[str, str]:
+    """``{name: kind}`` for ``[tool.uv.sources]`` entries uv would build or fetch directly.
+
+    Index sources (``{ index = "…" }``) are not included: those resolve from
+    an index like any registry requirement.
+    """
+    sources = pyproject.get("tool", {}).get("uv", {}).get("sources") or {}
+    found: dict[str, str] = {}
+    for name, source in sources.items():
+        entries = source if isinstance(source, list) else [source]
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            kind = next((k for k in ("path", "workspace", "git", "url") if k in entry), None)
+            if kind is not None:
+                found[normalise(str(name))] = kind
+    return found
+
+
+def source_direct_refs(manifest: Path, listed: dict[str, str]) -> list[str]:
+    """Listed dependencies that ``[tool.uv.sources]`` maps to a path, VCS or URL."""
+    data = tomlkit.parse(manifest.read_text(encoding="utf-8")).unwrap()
+    return [
+        f"{name} ([tool.uv.sources]: {kind})"
+        for name, kind in sorted(local_sources(data).items()) if name in listed
+    ]
 
 
 def open_document(
@@ -421,30 +445,27 @@ class PipWorkspace:
         self.ignore_direct_references = ignore_direct_references
         self.counter = 0
         self._runtime_pins: dict[str, str] | None = None
-        self._copy_includes(manifest.parent, self.original.text, set())
+        self.tree: RequirementsTree | None = None
+        if fmt != DependencyFormat.PYPROJECT_PEP621:
+            self.tree = inspect_tree(manifest, self.target_dir)
+            if not ignore_direct_references:
+                check_no_direct_references(self.tree, manifest)
+            self._copy_includes(manifest.resolve())
 
-    def _copy_includes(self, source_dir: Path, text: str, seen: set[Path]) -> None:
-        for line in text.splitlines():
-            match = _INCLUDE.match(line)
-            if not match:
+    def _copy_includes(self, manifest: Path) -> None:
+        """Mirror every included file into the scratch root, without direct lines.
+
+        Direct lines are refused unless --ignore-direct-references, in which
+        case they are dropped from every copy, so uv never meets a path,
+        archive, VCS or URL requirement of the target.
+        """
+        assert self.tree is not None
+        for path in self.tree.files:
+            if path == manifest:
                 continue
-            rel = Path(match.group(1))
-            src = (source_dir / rel).resolve()
-            if src in seen or not src.is_file():
-                continue
-            seen.add(src)
-            try:
-                inside = src.relative_to(self.target_dir)
-            except ValueError:
-                raise DepfreshError(
-                    f"{self.manifest_name} includes {rel}, outside {self.target_dir}; "
-                    "depfresh only follows includes inside the target directory"
-                ) from None
-            dest = self.root / inside
+            dest = self.root / self.tree.relative(path)
             dest.parent.mkdir(parents=True, exist_ok=True)
-            content = read_text_file(src).text
-            dest.write_text(content, encoding="utf-8")
-            self._copy_includes(src.parent, content, seen)
+            dest.write_text(self.tree.sanitized(path), encoding="utf-8")
 
     def write(self, text: str) -> Path:
         """Write a candidate manifest (UTF-8, direct references stripped if allowed)."""
@@ -461,15 +482,16 @@ class PipWorkspace:
         return path
 
     def _strip_direct_refs(self, text: str) -> str:
-        if not self.ignore_direct_references:
-            return text
         if self.fmt == DependencyFormat.PYPROJECT_PEP621:
-            return strip_pyproject_direct_refs(text)
-        doc = RequirementsDocument(text)
-        refs = set(doc.direct_refs)
-        kept = [line for line in text.splitlines(keepends=True)
-                if _code_part(line).strip() not in refs]
-        return "".join(kept)
+            return strip_pyproject_direct_refs(text) if self.ignore_direct_references else text
+        lines = parse_lines(text)
+        direct = [line for line in lines if line.kind == "direct"]
+        if direct and not self.ignore_direct_references:
+            refs = [d.requirement or d.code for d in direct]
+            raise DirectReferenceError(self.manifest_name, refs)
+        physical = text.splitlines(keepends=True)
+        drop = {i for d in direct for i in range(d.start, d.end + 1)}
+        return "".join(line for i, line in enumerate(physical) if i not in drop)
 
     def runtime_pins(self) -> dict[str, str]:
         """The resolution without any extra (where a transitive floor belongs)."""
@@ -615,8 +637,13 @@ def remediate_pip(
     ws = PipWorkspace(uv, target_dir, manifest, fmt, work_dir, options, ignore_direct_references)
     original = ws.original.text
     doc = open_document(fmt, original, options)
-    if doc.direct_refs and not ignore_direct_references:
-        raise DirectReferenceError(str(manifest), doc.direct_refs)
+    direct_refs = list(doc.direct_refs)
+    if fmt == DependencyFormat.PYPROJECT_PEP621:
+        direct_refs += source_direct_refs(manifest, doc.listed())
+    elif ws.tree is not None:
+        direct_refs = list(ws.tree.direct)
+    if direct_refs and not ignore_direct_references:
+        raise DirectReferenceError(str(manifest), direct_refs)
 
     baseline = ws.compile(ws.write(original), record=True)
     private = baseline.private()
@@ -638,7 +665,7 @@ def remediate_pip(
             plans=plan(pre_vulns, baseline.pins, options, sources, private), failures={},
             new_text=original, changed=False, resolution_check="",
             commands=ws.commands, notes=notes, not_audited=not_audited, gate=gate,
-            direct_refs=doc.direct_refs, original_text=original,
+            direct_refs=direct_refs, original_text=original,
         )
 
     venv = work_dir / venv_name
@@ -698,7 +725,7 @@ def remediate_pip(
         baseline=baseline, final=final, pre_vulns=pre_vulns, post_vulns=current_vulns,
         plans=plans, failures=failures, new_text=new_text, changed=changed,
         resolution_check=resolution_check, commands=ws.commands, notes=notes,
-        not_audited=not_audited, gate=gate, direct_refs=doc.direct_refs,
+        not_audited=not_audited, gate=gate, direct_refs=direct_refs,
         original_text=original,
     )
 
