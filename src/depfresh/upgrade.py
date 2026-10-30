@@ -46,6 +46,8 @@ from depfresh.parsers import (
     SetupPyHandler,
     choose_dep_file,
     detect_format,
+    dockerfile_uv_sync_flags,
+    extras_of_uv_flags,
     get_handler,
 )
 from depfresh.pipmode import (
@@ -648,6 +650,7 @@ class _Manifest:
     handler: FormatHandler
     dockerfile_extras: tuple[str, ...] = ()
     detection_reason: str = ""
+    dockerfile_uv_flags: tuple[str, ...] | None = None
 
     @property
     def is_uv_lock_project(self) -> bool:
@@ -659,6 +662,7 @@ class _Manifest:
 
 
 def _resolve_manifest(target_dir: Path, dep_file: str | None, fmt: str | None) -> _Manifest:
+    uv_flags: tuple[str, ...] | None = None
     if dep_file:
         path = target_dir / dep_file
         extras: tuple[str, ...] = ()
@@ -669,11 +673,16 @@ def _resolve_manifest(target_dir: Path, dep_file: str | None, fmt: str | None) -
         except FileNotFoundError as exc:
             raise RequirementsNotFoundError(str(target_dir)) from exc
         path, extras, reason = choice.path, choice.extras, choice.reason
+        uv_flags = choice.uv_sync_flags
         log.info("Auto-detected %s: %s", path.name, reason)
     if not path.exists():
         raise RequirementsNotFoundError(str(path))
+    if dep_file and path.name == "pyproject.toml" and (path.parent / "uv.lock").is_file():
+        uv_flags = dockerfile_uv_sync_flags(path.parent)
+        extras = extras_of_uv_flags(uv_flags or ())
     dep_format = DependencyFormat(fmt) if fmt else detect_format(path)
-    return _Manifest(target_dir, path, dep_format, get_handler(dep_format), extras, reason)
+    return _Manifest(target_dir, path, dep_format, get_handler(dep_format), extras, reason,
+                     uv_flags)
 
 
 def _options(
@@ -692,7 +701,18 @@ def _options(
     manifest: _Manifest,
 ) -> RemediationOptions:
     chosen_extras = tuple(_split_names(extras))
-    if not chosen_extras and not all_extras and manifest.dockerfile_extras:
+    chosen_groups = tuple(_split_names(groups))
+    user_chose = bool(chosen_extras or chosen_groups or all_extras or all_groups
+                      or dependency_scope == "all")
+    uv_flags = None
+    if not user_chose and manifest.is_uv_lock_project and manifest.dockerfile_uv_flags is not None:
+        uv_flags = manifest.dockerfile_uv_flags
+        chosen_extras = extras_of_uv_flags(uv_flags)
+        log.info(
+            "Exporting what the Dockerfile's uv sync installs: %s (override with --group/--extra)",
+            " ".join(uv_flags) or "the default groups, dev included",
+        )
+    elif not chosen_extras and not all_extras and manifest.dockerfile_extras:
         chosen_extras = manifest.dockerfile_extras
         log.info(
             "Using the extras the Dockerfile installs: %s (override with --extra)",
@@ -706,8 +726,9 @@ def _options(
         import_check=import_check,
         extras=chosen_extras,
         all_extras=all_extras or dependency_scope == "all",
-        groups=tuple(_split_names(groups)),
+        groups=chosen_groups,
         all_groups=all_groups or dependency_scope == "all",
+        uv_group_flags=uv_flags,
     )
 
 
@@ -780,7 +801,11 @@ def _lock_result(
         strategy="minimal",
         platform=options.env.platform,
         extras=list(options.extras) or (["(all)"] if options.all_extras else []),
-        groups=list(options.groups) or (["(all)"] if options.all_groups else ["(no dev)"]),
+        groups=(
+            [f"(Dockerfile: uv sync {' '.join(options.uv_group_flags) or 'default groups'})"]
+            if options.uv_group_flags is not None
+            else list(options.groups) or (["(all)"] if options.all_groups else ["(no dev)"])
+        ),
         fixes=fixes,
         lock_changes=outcome.lock_changes,
         lock_check=outcome.lock_check,

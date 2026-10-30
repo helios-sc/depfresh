@@ -99,6 +99,9 @@ class DepFileChoice:
     path: Path
     reason: str
     extras: tuple[str, ...] = ()
+    #: Group and extra flags of the Dockerfile's ``uv sync`` (uv projects), to
+    #: export exactly what the image installs; ``None`` without such a line.
+    uv_sync_flags: tuple[str, ...] | None = None
 
 
 def detect_dep_file(target_dir: Path) -> Path:
@@ -127,7 +130,11 @@ def choose_dep_file(target_dir: Path) -> DepFileChoice:
     has_pyproject = _declares_dependencies(pyproject)
 
     if has_pyproject and (target_dir / "uv.lock").exists():
-        return DepFileChoice(pyproject, "pyproject.toml with uv.lock (the lock is what ships)")
+        flags = dockerfile_uv_sync_flags(target_dir)
+        reason = "pyproject.toml with uv.lock (the lock is what ships)"
+        if flags is not None:
+            reason += f"; the Dockerfile runs uv sync {' '.join(flags) or '(default groups)'}"
+        return DepFileChoice(pyproject, reason, extras_of_uv_flags(flags or ()), flags)
 
     hint = _dockerfile_hint(target_dir, has_pyproject)
     if hint is not None:
@@ -187,12 +194,7 @@ _UV_SYNC = re.compile(r"\buv\s+sync\b(?P<args>[^;&|]*)")
 
 def _dockerfile_hint(target_dir: Path, has_pyproject: bool) -> DepFileChoice | None:
     """Infer the shipped manifest from the RUN instructions of local Dockerfiles."""
-    dockerfiles = sorted(
-        p for p in target_dir.iterdir()
-        if p.is_file() and (p.name == "Dockerfile" or p.name.startswith("Dockerfile.")
-                            or p.name.endswith(".Dockerfile"))
-    )
-    for dockerfile in dockerfiles:
+    for dockerfile in _dockerfiles(target_dir):
         try:
             text = dockerfile.read_text(encoding="utf-8", errors="replace")
         except OSError:
@@ -223,6 +225,64 @@ def _dockerfile_hint(target_dir: Path, has_pyproject: bool) -> DepFileChoice | N
                     target_dir / "pyproject.toml", f"{dockerfile.name} runs uv sync", extras,
                 )
     return None
+
+
+#: ``uv sync`` options that select groups and extras, and whether they take a value.
+_UV_GROUP_FLAGS = {
+    "--extra": True, "--no-extra": True, "--all-extras": False,
+    "--group": True, "--no-group": True, "--only-group": True, "--all-groups": False,
+    "--no-default-groups": False, "--no-dev": False, "--dev": False, "--only-dev": False,
+}
+
+
+def dockerfile_uv_sync_flags(target_dir: Path) -> tuple[str, ...] | None:
+    """Group and extra flags of the first ``uv sync`` in a local Dockerfile.
+
+    Returns ``None`` when no Dockerfile runs ``uv sync``, and ``()`` for a plain
+    ``uv sync``, which installs the default groups (dev included).
+    """
+    for dockerfile in _dockerfiles(target_dir):
+        try:
+            text = dockerfile.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            continue
+        for command in _run_commands(text):
+            match = _UV_SYNC.search(command)
+            if match:
+                return _group_flags(match.group("args").split())
+    return None
+
+
+def _group_flags(tokens: list[str]) -> tuple[str, ...]:
+    flags: list[str] = []
+    i = 0
+    while i < len(tokens):
+        token = tokens[i]
+        name, eq, value = token.partition("=")
+        if name in _UV_GROUP_FLAGS:
+            if _UV_GROUP_FLAGS[name]:
+                if eq:
+                    flags += [name, value]
+                elif i + 1 < len(tokens):
+                    flags += [name, tokens[i + 1]]
+                    i += 1
+            else:
+                flags.append(name)
+        i += 1
+    return tuple(flags)
+
+
+def extras_of_uv_flags(flags: tuple[str, ...]) -> tuple[str, ...]:
+    """The ``--extra`` names in a ``uv sync`` flag list."""
+    return tuple(flags[i + 1] for i, f in enumerate(flags[:-1]) if f == "--extra")
+
+
+def _dockerfiles(target_dir: Path) -> list[Path]:
+    return sorted(
+        p for p in target_dir.iterdir()
+        if p.is_file() and (p.name == "Dockerfile" or p.name.startswith("Dockerfile.")
+                            or p.name.endswith(".Dockerfile"))
+    )
 
 
 def _run_commands(dockerfile_text: str) -> list[str]:
@@ -266,6 +326,8 @@ __all__ = [
     "detect_dep_file",
     "choose_dep_file",
     "DepFileChoice",
+    "dockerfile_uv_sync_flags",
+    "extras_of_uv_flags",
     "get_handler",
     "_FORMAT_CHOICES",
     "_merge_continuation_lines",

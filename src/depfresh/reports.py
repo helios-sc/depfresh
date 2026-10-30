@@ -450,6 +450,9 @@ def _md_commands(md: list[str], report: UpgradeResult) -> None:
 
 
 def _group_flags(report: UpgradeResult) -> str:
+    if report.groups and report.groups[0].startswith("(Dockerfile: uv sync "):
+        text = report.groups[0][len("(Dockerfile: uv sync "):].rstrip(")")
+        return "" if text == "default groups" else text
     flags = []
     if report.groups == ["(all)"]:
         flags.append("--all-groups")

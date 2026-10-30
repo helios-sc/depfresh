@@ -138,6 +138,44 @@ class TestGroupArgs:
         assert group_args(RemediationOptions(env=ENV, **kwargs)) == expected
 
 
+class TestDockerfileGroups:
+    """`RUN uv sync --frozen --extra gcs` ships the gcs extra: export it."""
+
+    def test_flags_are_used_verbatim(self) -> None:
+        options = RemediationOptions(env=ENV, uv_group_flags=("--no-dev", "--extra", "gcs"))
+        assert group_args(options) == ["--no-dev", "--extra", "gcs"]
+
+    def test_plain_uv_sync_exports_the_default_groups(self) -> None:
+        assert group_args(RemediationOptions(env=ENV, uv_group_flags=())) == []
+
+    def test_upgrade_exports_what_the_dockerfile_installs(self, tmp_path: Path) -> None:
+        project = tmp_path / "proj"
+        project.mkdir()
+        (project / "pyproject.toml").write_text(
+            '[project]\nname = "x"\nversion = "1"\ndependencies = ["six"]\n'
+            '[project.optional-dependencies]\ngcs = ["google-cloud-storage"]\n'
+        )
+        (project / "uv.lock").write_text(_lock_text({"six": "1.17.0"}))
+        (project / "Dockerfile").write_text("FROM python:3.12\nRUN uv sync --frozen --extra gcs\n")
+        seen: dict[str, Any] = {}
+
+        def fake(**kwargs: Any) -> None:
+            seen["options"] = kwargs["options"]
+            raise RuntimeError("stop")
+
+        with (
+            patch.object(_upgrade_mod, "find_uv", return_value="/usr/bin/uv"),
+            patch.object(_upgrade_mod, "get_uv_version", return_value="0.13.6"),
+            patch.object(_upgrade_mod, "install_pip_audit",
+                         return_value=("/tool/bin/python", "2.10.1")),
+            patch.object(_upgrade_mod, "remediate_lock", side_effect=fake),
+        ):
+            with pytest.raises(RuntimeError, match="stop"):
+                upgrade(project, reports_dir=tmp_path / "r")
+        assert group_args(seen["options"]) == ["--extra", "gcs"]
+        assert seen["options"].extras == ("gcs",)
+
+
 class TestIndexes:
     def test_pypi_hosts(self) -> None:
         assert is_pypi_index("https://pypi.org/simple")

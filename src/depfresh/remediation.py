@@ -62,6 +62,9 @@ class RemediationOptions:
     groups: tuple[str, ...] = ()
     all_groups: bool = False
     max_rounds: int = 3
+    #: Exact group/extra flags to export with (from the Dockerfile's ``uv sync``);
+    #: ``None`` derives them from the fields above.
+    uv_group_flags: tuple[str, ...] | None = None
 
 
 @dataclass

@@ -206,6 +206,8 @@ def shipped_set(export_text: str, env: TargetEnv, locked: list[LockedPackage]) -
 
 def group_args(options: RemediationOptions) -> list[str]:
     """Dependency-group and extra flags shared by ``uv export`` and ``uv sync``."""
+    if options.uv_group_flags is not None:
+        return list(options.uv_group_flags)
     args: list[str] = []
     if options.all_groups:
         args.append("--all-groups")

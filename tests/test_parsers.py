@@ -185,6 +185,35 @@ class TestChooseDepFile:
         assert choice.path.name == "requirements.txt"
         assert "--dep-file" in caplog.text
 
+    def test_uv_project_takes_the_dockerfiles_uv_sync_flags(self, tmp_path: Path) -> None:
+        self._project(tmp_path, "FROM python:3.12\nRUN uv sync --frozen --no-dev --extra gcs\n",
+                      lock=True)
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert choice.uv_sync_flags == ("--no-dev", "--extra", "gcs")
+        assert choice.extras == ("gcs",)
+
+    def test_plain_uv_sync_installs_the_default_groups(self, tmp_path: Path) -> None:
+        self._project(tmp_path, "FROM python:3.12\nRUN uv sync --frozen --no-install-project\n",
+                      lock=True)
+        assert choose_dep_file(tmp_path).uv_sync_flags == ()
+
+    def test_uv_project_without_dockerfile(self, tmp_path: Path) -> None:
+        self._project(tmp_path, lock=True)
+        assert choose_dep_file(tmp_path).uv_sync_flags is None
+
+    @pytest.mark.parametrize(
+        ("command", "flags"),
+        [
+            ("uv sync --frozen --extra=gcs --group prod", ("--extra", "gcs", "--group", "prod")),
+            ("uv sync --all-extras --no-default-groups", ("--all-extras", "--no-default-groups")),
+            ("uv sync --locked --only-group web", ("--only-group", "web")),
+        ],
+    )
+    def test_flag_forms(self, tmp_path: Path, command: str, flags: tuple[str, ...]) -> None:
+        self._project(tmp_path, f"FROM python:3.12\nRUN {command}\n", lock=True)
+        assert choose_dep_file(tmp_path).uv_sync_flags == flags
+
     def test_tool_only_pyproject_is_not_a_manifest(self, tmp_path: Path) -> None:
         (tmp_path / "pyproject.toml").write_text("[tool.ruff]\nline-length = 100\n")
         (tmp_path / "uv.lock").write_text("version = 1\n")
