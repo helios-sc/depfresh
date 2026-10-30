@@ -483,7 +483,7 @@ class TestRemediatePip:
         assert outcome.new_text == "requests==2.33.0\nurllib3>=2.8.0  # depfresh: GHSA-urllib3\n"
 
     def test_pyproject_cap_is_raised_in_place(self, tmp_path: Path) -> None:
-        """A cap that keeps the vulnerable release is lifted to the next major only."""
+        """A cap that keeps the vulnerable release moves only as far as the fix needs."""
         resolver = FakeResolver({"pypdf": ["6.21.0", "6.25.0", "7.0.0"]}, {})
         text = '[project]\nname = "x"\ndependencies = [\n    "pypdf>=6.21,<6.22",\n]\n'
 
@@ -499,7 +499,7 @@ class TestRemediatePip:
         outcome = _remediate(tmp_path, text, capped,  # type: ignore[arg-type]
                              {"pypdf": {"6.21.0"}}, {"pypdf": "6.25.0"},
                              fmt=DependencyFormat.PYPROJECT_PEP621, name="pyproject.toml")
-        assert '"pypdf>=6.25.0,<7",' in outcome.new_text
+        assert '"pypdf>=6.25.0,<6.26",' in outcome.new_text
 
     def test_direct_references_fail_closed(self, tmp_path: Path) -> None:
         resolver = FakeResolver({"six": ["1.17.0"]}, {})

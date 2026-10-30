@@ -146,7 +146,7 @@ With `--dep-file services/api/pyproject.toml` the run works on that subproject: 
 
 Requirements files (simple, hashed, `.in`), `pyproject.toml` without a lock and a static `setup.py` ship whatever a fresh resolution picks when the image is built. depfresh resolves exactly that, for the deploy target, with `uv pip compile --python-platform x86_64-unknown-linux-gnu --python-version X.Y`, then:
 
-- edits **only the affected lines**: a pin moves (`==`), a floor is raised (`>=`), a cap that blocks the fix is lifted to the next major only when `--allow-major` allows it. Comments, markers, extras, name spelling, ordering and line endings stay; `--hash` lines are regenerated;
+- edits **only the affected lines**: a pin moves (`==`), a floor is raised (`>=`), a cap that blocks the fix is lifted only as far as the fix needs, at its own granularity (`<6.22` → `<6.26`, `~=2.31.0` → `~=2.32.1`, `==2.31.*` → `>=2.32.1,==2.32.*`, epochs included), and never dropped; crossing a major still needs `--allow-major`. Comments, markers, extras, name spelling, ordering and line endings stay; `--hash` lines are regenerated;
 - adds a commented floor for a vulnerable transitive package the file does not list: `urllib3>=2.8.0  # depfresh: GHSA-8988-9cw3-xx77`;
 - when another pin blocks a fix (`fastapi==0.129.0` caps Starlette below 1.0), finds the **lowest** co-upgrade that resolves (every current version is kept as a preference) and pins it;
 - resolves the edited file again, fresh, as the build would, and audits that.
