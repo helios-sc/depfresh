@@ -777,6 +777,7 @@ def remediate_pip(
 
     plans: dict[str, FixPlan] = {}
     failures: dict[str, str] = {}
+    hashed = isinstance(doc, RequirementsDocument) and any(e.hashed for e in doc.all_entries)
     edits: dict[str, str] = {}        # listed package -> new specifier
     additions: dict[str, tuple[str, str]] = {}  # unlisted package -> (specifier, comment)
     current, current_vulns = baseline, pre_vulns
@@ -798,6 +799,11 @@ def remediate_pip(
         text = _render(fmt, original, options, edits, additions, ws)
         try:
             current = ws.compile(ws.write(text))
+            if hashed and _pin_new_dependencies(
+                fmt, text, options, baseline, current, additions,
+            ):
+                text = _render(fmt, original, options, edits, additions, ws)
+                current = ws.compile(ws.write(text))
         except CommandError as exc:
             notes.append(f"Edited manifest does not resolve: {_first_line(exc.stderr)}")
             break
@@ -830,6 +836,34 @@ def remediate_pip(
         not_audited=not_audited, gate=gate, direct_refs=direct_refs,
         original_text=original,
     )
+
+
+def _pin_new_dependencies(
+    fmt: DependencyFormat,
+    text: str,
+    options: RemediationOptions,
+    baseline: Resolution,
+    current: Resolution,
+    additions: dict[str, tuple[str, str]],
+) -> bool:
+    """Hash-checking files must list every package: pin what a fixed release now needs.
+
+    pip's ``--require-hashes`` mode refuses to install anything the file does
+    not pin and hash, so a dependency that only the fixed release brings in
+    (aiohttp 3.10 needs aiohappyeyeballs) is added as a hashed ``==`` pin.
+
+    Returns:
+        True when *additions* changed.
+    """
+    listed = set(open_document(fmt, text, options).listed()) | set(additions)
+    new = {
+        name: version for name, version in current.pins.items()
+        if name not in listed and name not in baseline.pins
+    }
+    for name, version in sorted(new.items()):
+        parents = ", ".join(sorted(current.via.get(name) or [])) or "the fixed releases"
+        additions[name] = (f"=={version}", f"depfresh: required by {parents}")
+    return bool(new)
 
 
 def _first_line(text: str) -> str:

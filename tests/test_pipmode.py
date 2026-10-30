@@ -31,6 +31,7 @@ from depfresh.pipmode import (
     strip_pyproject_direct_refs,
 )
 from depfresh.remediation import RemediationOptions
+from depfresh.reqlines import parse_lines
 
 if sys.version_info >= (3, 11):
     import tomllib
@@ -242,11 +243,10 @@ class FakeResolver:
         self.calls.append({"text": text, "preferences": preferences is not None,
                            "lowest": lowest_direct})
         direct: dict[str, SpecifierSet] = {}
-        for line in text.splitlines():
-            code = line.split("#", 1)[0].strip()
-            if not code or code.startswith("-"):
+        for line in parse_lines(text):
+            if line.kind != "registry":
                 continue
-            req = Requirement(code)
+            req = Requirement(line.requirement)
             if req.marker is not None and not req.marker.evaluate(ENV.marker_environment()):
                 continue
             name = normalise(req.name)
@@ -265,14 +265,25 @@ class FakeResolver:
 
         for combo in itertools.product(*(ordered(n) for n in names)):
             chosen = dict(zip(names, combo))
+            reach: dict[str, set[str]] = {n: set() for n in direct}
+            todo = list(direct)
+            while todo:  # only packages the requirements actually pull in ship
+                pkg = todo.pop()
+                for dep in self.requires.get((pkg, chosen[pkg]), {}):
+                    if dep not in reach:
+                        reach[dep] = set()
+                        todo.append(dep)
+                    reach[dep].add(pkg)
             if all(Version(chosen[n]) in spec for n, spec in direct.items()) and all(
                 Version(chosen[dep]) in SpecifierSet(spec)
-                for (pkg, ver), deps in self.requires.items() if chosen.get(pkg) == ver
+                for (pkg, ver), deps in self.requires.items()
+                if pkg in reach and chosen.get(pkg) == ver
                 for dep, spec in deps.items()
             ):
                 body = "".join(
-                    f"{n}=={v}  # via -r requirements.txt\n    # from https://pypi.org/simple\n"
-                    for n, v in sorted(chosen.items())
+                    f"{n}=={chosen[n]}  # via {', '.join(sorted(reach[n])) or '-r x'}\n"
+                    "    # from https://pypi.org/simple\n"
+                    for n in sorted(reach)
                 )
                 return parse_compile_output(body)
         raise CommandError(["uv", "pip", "compile"], 1, "error: No solution found")
@@ -592,3 +603,34 @@ class TestContinuationEdits:
             "urllib3==1.26.0 \\\n"
             "    --hash=sha256:bbb\n"
         )
+
+
+
+class TestHashedNewDependencies:
+    """pip --require-hashes needs every package pinned: a fix's new dependency too."""
+
+    def test_new_dependency_is_pinned_with_hashes(self, tmp_path: Path) -> None:
+        universe = {"aiohttp": ["3.9.0", "3.10.11"], "yarl": ["1.9.0"],
+                    "aiohappyeyeballs": ["2.4.0"]}
+        requires = {("aiohttp", "3.9.0"): {"yarl": ">=1.0"},
+                    ("aiohttp", "3.10.11"): {"yarl": ">=1.0", "aiohappyeyeballs": ">=2.3"}}
+        text = ("aiohttp==3.9.0 \\\n    --hash=sha256:old-a\n    # via -r requirements.in\n"
+                "yarl==1.9.0 \\\n    --hash=sha256:old-y\n    # via aiohttp\n")
+
+        def fake_hashes(ws: PipWorkspace, pins: dict[str, str]) -> dict[str, list[str]]:
+            return {n: [f"sha256:{n}-{v}"] for n, v in pins.items()}
+
+        with patch.object(PipWorkspace, "hashes", fake_hashes):
+            outcome = _remediate(tmp_path, text, FakeResolver(universe, requires),
+                                 {"aiohttp": {"3.9.0"}}, {"aiohttp": "3.10.11"},
+                                 fmt=DependencyFormat.REQUIREMENTS_HASHED)
+        assert outcome.new_text == (
+            "aiohttp==3.10.11 \\\n    --hash=sha256:aiohttp-3.10.11\n"
+            "    # via -r requirements.in\n"
+            "yarl==1.9.0 \\\n    --hash=sha256:old-y\n    # via aiohttp\n"
+            "aiohappyeyeballs==2.4.0 \\\n    --hash=sha256:aiohappyeyeballs-2.4.0\n"
+            "    # depfresh: required by aiohttp\n"
+        )
+        # the file is complete for the final resolution
+        listed = set(RequirementsDocument(outcome.new_text, env=ENV).listed())
+        assert set(outcome.final.pins) <= listed
