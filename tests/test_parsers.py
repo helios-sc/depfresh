@@ -19,6 +19,7 @@ from depfresh.parsers import (
     RequirementsInHandler,
     RequirementsSimpleHandler,
     _merge_continuation_lines,
+    choose_dep_file,
     detect_dep_file,
     detect_format,
     get_handler,
@@ -118,6 +119,108 @@ class TestDetectDepFile:
             detect_dep_file(tmp_path)
 
 
+class TestChooseDepFile:
+    """What ships wins over the historical requirements.txt-first order."""
+
+    @staticmethod
+    def _project(tmp_path: Path, dockerfile: str | None = None, lock: bool = False) -> None:
+        (tmp_path / "requirements.txt").write_text("pandas>=2.0.0\n")
+        (tmp_path / "pyproject.toml").write_text(dedent("""\
+            [project]
+            name = "demo"
+            dependencies = ["pandas"]
+
+            [project.optional-dependencies]
+            full = ["xgboost"]
+            gcs = ["google-cloud-storage>=2.0"]
+        """))
+        if lock:
+            (tmp_path / "uv.lock").write_text("version = 1\n")
+        if dockerfile is not None:
+            (tmp_path / "Dockerfile").write_text(dockerfile)
+
+    def test_prefers_pyproject_when_a_uv_lock_exists(self, tmp_path: Path) -> None:
+        self._project(tmp_path, lock=True)
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert "uv.lock" in choice.reason
+
+    def test_dead_requirements_txt_loses_to_the_installed_project(self, tmp_path: Path) -> None:
+        """The Dockerfile installs .[full,gcs]; requirements.txt is unused."""
+        self._project(
+            tmp_path,
+            'FROM python:3.11-bookworm\nCOPY . .\n'
+            'RUN pip install --no-cache-dir -e ".[full,gcs]"\n',
+        )
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert choice.extras == ("full", "gcs")
+
+    def test_plain_project_install(self, tmp_path: Path) -> None:
+        self._project(tmp_path, "FROM python:3.11\nRUN pip install --no-cache-dir -e .\n")
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert choice.extras == ()
+
+    def test_requirements_file_named_by_the_dockerfile(self, tmp_path: Path) -> None:
+        self._project(
+            tmp_path,
+            "FROM python:3.11\nCOPY ./requirements.txt /code/requirements.txt\n"
+            "RUN pip install --no-cache-dir --upgrade \\\n    -r /code/requirements.txt\n",
+        )
+        assert choose_dep_file(tmp_path).path.name == "requirements.txt"
+
+    def test_uv_sync_with_extras(self, tmp_path: Path) -> None:
+        self._project(tmp_path, "FROM python:3.12\nRUN uv sync --no-dev --extra gcs\n")
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert choice.extras == ("gcs",)
+
+    def test_without_hints_keeps_requirements_first(
+        self, tmp_path: Path, caplog: pytest.LogCaptureFixture,
+    ) -> None:
+        self._project(tmp_path)
+        with caplog.at_level(logging.WARNING, logger="depfresh"):
+            choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "requirements.txt"
+        assert "--dep-file" in caplog.text
+
+    def test_uv_project_takes_the_dockerfiles_uv_sync_flags(self, tmp_path: Path) -> None:
+        self._project(tmp_path, "FROM python:3.12\nRUN uv sync --frozen --no-dev --extra gcs\n",
+                      lock=True)
+        choice = choose_dep_file(tmp_path)
+        assert choice.path.name == "pyproject.toml"
+        assert choice.uv_sync_flags == ("--no-dev", "--extra", "gcs")
+        assert choice.extras == ("gcs",)
+
+    def test_plain_uv_sync_installs_the_default_groups(self, tmp_path: Path) -> None:
+        self._project(tmp_path, "FROM python:3.12\nRUN uv sync --frozen --no-install-project\n",
+                      lock=True)
+        assert choose_dep_file(tmp_path).uv_sync_flags == ()
+
+    def test_uv_project_without_dockerfile(self, tmp_path: Path) -> None:
+        self._project(tmp_path, lock=True)
+        assert choose_dep_file(tmp_path).uv_sync_flags is None
+
+    @pytest.mark.parametrize(
+        ("command", "flags"),
+        [
+            ("uv sync --frozen --extra=gcs --group prod", ("--extra", "gcs", "--group", "prod")),
+            ("uv sync --all-extras --no-default-groups", ("--all-extras", "--no-default-groups")),
+            ("uv sync --locked --only-group web", ("--only-group", "web")),
+        ],
+    )
+    def test_flag_forms(self, tmp_path: Path, command: str, flags: tuple[str, ...]) -> None:
+        self._project(tmp_path, f"FROM python:3.12\nRUN {command}\n", lock=True)
+        assert choose_dep_file(tmp_path).uv_sync_flags == flags
+
+    def test_tool_only_pyproject_is_not_a_manifest(self, tmp_path: Path) -> None:
+        (tmp_path / "pyproject.toml").write_text("[tool.ruff]\nline-length = 100\n")
+        (tmp_path / "uv.lock").write_text("version = 1\n")
+        (tmp_path / "requirements.txt").write_text("flask==2.3.0\n")
+        assert choose_dep_file(tmp_path).path.name == "requirements.txt"
+
+
 class TestGetHandler:
     @pytest.mark.parametrize("fmt", list(DependencyFormat))
     def test_returns_handler_for_each_format(self, fmt: DependencyFormat) -> None:
@@ -188,6 +291,37 @@ class TestRequirementsSimple:
 
     def test_is_pinned(self) -> None:
         assert RequirementsSimpleHandler().is_pinned is True
+
+    def test_write_edits_existing_files_in_place(self, tmp_path: Path) -> None:
+        """No more whole-environment freeze: comments, floors and order survive."""
+        req = tmp_path / "requirements.txt"
+        req.write_text(dedent("""\
+            # pinned for the gRPC stack
+            grpcio==1.80.0  # with grpcio-status
+            docstring_parser==0.17.0
+            google-cloud-storage>=2.10.0
+            pywin32==306 ; sys_platform == "win32"
+        """))
+        RequirementsSimpleHandler().write(
+            {"grpcio": "1.84.1", "docstring-parser": "0.17.0", "google-cloud-storage": "3.17.1",
+             "pywin32": "306", "protobuf": "6.33.6"},
+            req,
+        )
+        assert req.read_text() == dedent("""\
+            # pinned for the gRPC stack
+            grpcio==1.84.1  # with grpcio-status
+            docstring_parser==0.17.0
+            google-cloud-storage>=2.10.0
+            pywin32==306 ; sys_platform == "win32"
+        """)
+
+    def test_write_raises_a_floor_only_when_it_excludes_the_version(
+        self, tmp_path: Path,
+    ) -> None:
+        req = tmp_path / "requirements.txt"
+        req.write_text("cryptography>=41,<47\n")
+        RequirementsSimpleHandler().write({"cryptography": "50.0.2"}, req)
+        assert req.read_text() == "cryptography>=50.0.2,<51\n"
 
 
 # ===================================================================

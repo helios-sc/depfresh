@@ -7,11 +7,14 @@ import logging
 import pytest
 
 from depfresh.constraints import (
+    admit_version,
     build_constraints,
+    classify_bump,
     compute_changes,
     diagnose_remaining,
     format_allow_major,
     format_keep_version,
+    is_calver,
     normalise,
 )
 from depfresh.models import Vulnerability
@@ -250,3 +253,78 @@ class TestUnknownPackageWarnings:
             build_constraints({"flask": "2.0"}, allow_major=[])
         warning_messages = [rec.message for rec in caplog.records if rec.levelno >= logging.WARNING]
         assert not warning_messages
+
+
+class TestAdmitVersion:
+    """Raise the floor to the fix; lift caps only as far as it needs, never drop them."""
+
+    @pytest.mark.parametrize(("spec", "target", "expected"), [
+        ("==2.6.3", "2.8.0", "==2.8.0"),
+        ("===1.0", "1.1", "==1.1"),
+        (">=2.10.0", "3.17.1", ">=3.17.1"),
+        ("", "2.8.0", ">=2.8.0"),
+        # caps that admit the fix stay as written
+        (">=6.21,<7", "6.25.0", ">=6.25.0,<7"),
+        (">=1,<=2.0", "1.5", ">=1.5,<=2.0"),
+        # caps that exclude it move at their own granularity
+        (">=6.21,<6.22", "6.25.0", ">=6.25.0,<6.26"),
+        (">=41,<47", "50.0.2", ">=50.0.2,<51"),
+        ("<2.31.5", "2.31.7", ">=2.31.7,<2.31.8"),
+        ("<=2.31", "2.32.1", ">=2.32.1,<=2.32.1"),
+        # compatible release keeps its width
+        ("~=2.31.0", "2.31.5", "~=2.31.5"),
+        ("~=2.31.0", "2.32.1", "~=2.32.1"),
+        ("~=2.31.0", "2.32", ">=2.32,==2.32.*"),
+        ("~=2.31.0", "2.32.1.4", ">=2.32.1.4,==2.32.*"),
+        ("~=2.31", "3.0.1", ">=3.0.1,==3.*"),
+        # wildcard pins keep their prefix width
+        ("==2.31.*", "2.31.4", ">=2.31.4,==2.31.*"),
+        ("==2.31.*", "2.32.1", ">=2.32.1,==2.32.*"),
+        # epochs
+        ("~=1!2.0", "1!3.1", "~=1!3.1"),
+        ("<1!3", "1!3.2", ">=1!3.2,<1!4"),
+        ("==1!2.*", "1!3.0.1", ">=1!3.0.1,==1!3.*"),
+        # exclusions stay unless they exclude the fix
+        (">=2,!=2.31.*", "2.32.1", ">=2.32.1,!=2.31.*"),
+        (">=2,!=2.32.1", "2.32.1", ">=2.32.1"),
+    ])
+    def test_admits_the_target(self, spec: str, target: str, expected: str) -> None:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        result = admit_version(spec, target)
+        assert result == expected
+        assert Version(target) in SpecifierSet(result)
+
+    @pytest.mark.parametrize("spec", ["<6.22", "~=2.31.0", "==2.31.*", "<=2.31", ">=1,<2"])
+    def test_never_drops_an_upper_bound(self, spec: str) -> None:
+        from packaging.specifiers import SpecifierSet
+        from packaging.version import Version
+
+        assert Version("999") not in SpecifierSet(admit_version(spec, "2.40.0"))
+
+
+class TestClassifyBump:
+    @pytest.mark.parametrize(
+        ("old", "new", "kind"),
+        [
+            ("2.0.4", "2.0.6", "patch"),
+            ("4.13.0", "4.14.2", "minor"),
+            ("0.86.0", "0.87.0", "0.x-minor"),
+            ("0.6.3", "0.6.5", "patch"),
+            ("46.0.6", "50.0.2", "major"),
+            ("2026.2.25", "2026.10.23", "calver"),
+            ("2024.12.14", "2026.10.19", "calver"),
+            ("3.17.1", "2.19.0", "downgrade"),
+            ("1.0", "1.0.0", "same"),
+            ("(new)", "1.0", "new"),
+            ("1.0", "", "removed"),
+            ("1.0", "not-a-version", "unknown"),
+        ],
+    )
+    def test_kinds(self, old: str, new: str, kind: str) -> None:
+        assert classify_bump(old, new) == kind
+
+    def test_calendar_versions(self) -> None:
+        assert is_calver("2026.10.19")
+        assert not is_calver("23.12.1")  # black's YY.M scheme still counts as a major

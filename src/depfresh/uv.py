@@ -8,10 +8,13 @@ import re
 import shutil
 import subprocess
 import sys
+import sysconfig
 from pathlib import Path
 
+from packaging.version import InvalidVersion, Version
+
 from depfresh.constraints import normalise
-from depfresh.exceptions import CommandError, UvNotFoundError
+from depfresh.exceptions import CommandError, UvNotFoundError, UvVersionError
 
 log = logging.getLogger("depfresh")
 
@@ -20,21 +23,38 @@ log = logging.getLogger("depfresh")
 # Shell helper
 # ---------------------------------------------------------------------------
 
+#: uv settings from the caller's environment that would change what depfresh
+#: asks uv to do (``uv lock`` under ``UV_FROZEN`` does nothing, ``uv sync``
+#: under ``UV_PROJECT_ENVIRONMENT`` targets the user's venv…).
+_UV_ENV_OVERRIDES = (
+    "UV_FROZEN", "UV_LOCKED", "UV_NO_SYNC", "UV_PROJECT_ENVIRONMENT", "UV_NO_DEV",
+    "UV_NO_DEFAULT_GROUPS", "UV_DEV", "UV_RESOLUTION", "UV_UPGRADE",
+)
+
+
+def uv_env(extra: dict[str, str] | None = None) -> dict[str, str]:
+    """The environment for uv subprocesses: the caller's, minus overriding UV_* settings."""
+    env = {k: v for k, v in os.environ.items() if k not in _UV_ENV_OVERRIDES}
+    env.update(extra or {})
+    return env
+
+
 def run(
     cmd: list[str],
     *,
-    cwd: str | None = None,
+    cwd: str | Path | None = None,
     check: bool = True,
-    timeout: int = 600,
+    timeout: int = 1800,
+    env: dict[str, str] | None = None,
 ) -> subprocess.CompletedProcess[str]:
     """Run a command and return the result.
 
     Raises :class:`CommandError` when *check* is True and the command exits
     with a non-zero return code.
     """
-    log.debug("$ %s", " ".join(cmd))
+    log.debug("$ %s%s", " ".join(cmd), f"  (in {cwd})" if cwd else "")
     result = subprocess.run(
-        cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout,
+        cmd, capture_output=True, text=True, cwd=cwd, timeout=timeout, env=env,
     )
     if check and result.returncode != 0:
         log.debug("STDERR: %s", result.stderr.strip())
@@ -46,22 +66,96 @@ def run(
 # uv discovery
 # ---------------------------------------------------------------------------
 
-def find_uv() -> str:
-    """Locate the ``uv`` binary on PATH.
+#: Oldest uv depfresh supports.  Older releases cannot read the lockfile
+#: revisions current uv writes (uv 0.6.17 fails on ``revision = 3``) and lack
+#: options depfresh relies on (``uv export --no-emit-project``, ``uv lock
+#: --check``, ``--no-default-groups``, named ``[[tool.uv.index]]`` entries).
+MIN_UV_VERSION = "0.9.0"
 
-    Raises :class:`UvNotFoundError` if not found.
+#: Environment variable naming the uv binary to use.
+UV_ENV_VAR = "DEPFRESH_UV"
+
+
+def find_uv(explicit: str | None = None) -> str:
+    """Locate a ``uv`` binary that is at least :data:`MIN_UV_VERSION`.
+
+    Candidates, in order: *explicit* (``--uv``), the ``DEPFRESH_UV``
+    environment variable, a ``uv`` installed in the same environment as
+    depfresh, then every ``uv`` on ``PATH``.  An explicit choice is never
+    replaced by another binary: if it is missing or too old, that is an
+    error.  Otherwise the first candidate that is new enough wins, so an
+    old ``uv`` early on ``PATH`` is skipped (and logged), never used silently.
+
+    Raises:
+        UvNotFoundError: If no ``uv`` binary exists.
+        UvVersionError: If every ``uv`` found is older than the minimum.
     """
-    uv = shutil.which("uv")
-    if not uv:
-        raise UvNotFoundError()
-    return uv
+    chosen = explicit or os.environ.get(UV_ENV_VAR)
+    if chosen:
+        resolved = shutil.which(chosen) or (chosen if Path(chosen).is_file() else None)
+        if not resolved:
+            raise UvNotFoundError(f"uv binary {chosen!r} not found")
+        version = get_uv_version(resolved)
+        if not uv_version_ok(version):
+            raise UvVersionError([(resolved, version)], MIN_UV_VERSION)
+        return resolved
+
+    too_old: list[tuple[str, str]] = []
+    seen: set[str] = set()
+    for candidate in _uv_candidates():
+        real = os.path.realpath(candidate)
+        if real in seen:
+            continue
+        seen.add(real)
+        version = get_uv_version(candidate)
+        if uv_version_ok(version):
+            if too_old:
+                log.info(
+                    "Skipping uv %s (older than %s); using uv %s at %s",
+                    ", ".join(f"{v} at {p}" for p, v in too_old), MIN_UV_VERSION,
+                    version, candidate,
+                )
+            return candidate
+        too_old.append((candidate, version))
+    if too_old:
+        raise UvVersionError(too_old, MIN_UV_VERSION)
+    raise UvNotFoundError()
+
+
+def _uv_candidates() -> list[str]:
+    """uv binaries next to the running interpreter, then every uv on PATH."""
+    candidates: list[str] = []
+    exe = "uv.exe" if sys.platform == "win32" else "uv"
+    for directory in (sysconfig.get_path("scripts"), str(Path(sys.executable).parent)):
+        path = Path(directory) / exe
+        if path.is_file() and os.access(path, os.X_OK):
+            candidates.append(str(path))
+    for directory in os.environ.get("PATH", os.defpath).split(os.pathsep):
+        if not directory:
+            continue
+        path = Path(directory) / exe
+        if path.is_file() and os.access(path, os.X_OK):
+            candidates.append(str(path))
+    return candidates
+
+
+def uv_version_ok(version: str) -> bool:
+    """True when *version* parses and is at least :data:`MIN_UV_VERSION`."""
+    try:
+        return Version(version) >= Version(MIN_UV_VERSION)
+    except InvalidVersion:
+        return False
 
 
 def get_uv_version(uv: str) -> str:
-    """Return the version string for the given *uv* binary."""
-    result = run([uv, "--version"], check=False)
-    if result.returncode == 0:
-        return result.stdout.strip().split()[1]
+    """Return the version string for the given *uv* binary (``"unknown"`` on failure)."""
+    try:
+        result = run([uv, "--version"], check=False)
+    except OSError:
+        return "unknown"
+    parts = result.stdout.strip().split()
+    if result.returncode == 0 and len(parts) >= 2:
+        return parts[1]
     return "unknown"
 
 
@@ -119,7 +213,13 @@ def freeze(
     venv_python: str,
     extra_exclude: frozenset[str] | None = None,
 ) -> dict[str, str]:
-    """Freeze current environment, excluding pip-audit tooling.
+    """Freeze the current environment.
+
+    pip-audit runs from its own tool environment (see
+    :func:`depfresh.audit.install_pip_audit`), so every package in this
+    environment belongs to the project and is reported.  Earlier releases
+    dropped a static list of pip-audit's dependencies here, which also hid
+    the project's own ``msgpack``, ``rich``, ``platformdirs``… from the audit.
 
     Parameters
     ----------
@@ -128,29 +228,16 @@ def freeze(
     venv_python:
         Path to the Python binary inside the venv.
     extra_exclude:
-        Additional package names to exclude beyond the static baseline.
-        Pass the set returned by :func:`install_pip_audit` to ensure all
-        of pip-audit's transitive dependencies are filtered out.
+        Package names to leave out of the result.
 
     Returns
     -------
     dict[str, str]
         ``{normalised_name: version}``
     """
-    log.info("Freezing upgraded environment")
+    log.info("Freezing environment")
     result = run([uv, "pip", "freeze", "--python", venv_python])
-
-    # Static baseline: packages that pip-audit is known to install.
-    # Extended dynamically via extra_exclude to catch transitive deps
-    # that vary across pip-audit versions.
-    audit_deps: frozenset[str] = frozenset({
-        "pip", "pip-audit", "pip-api", "pip-requirements-parser",
-        "boolean-py", "cachecontrol", "cyclonedx-python-lib",
-        "defusedxml", "filelock", "license-expression", "markdown-it-py",
-        "mdurl", "msgpack", "packageurl-python", "platformdirs",
-        "py-serializable", "pygments", "rich", "tomli", "tomli-w",
-    })
-    exclude = audit_deps | (extra_exclude or frozenset())
+    exclude = extra_exclude or frozenset()
 
     pkgs: dict[str, str] = {}
     for line in result.stdout.splitlines():
@@ -163,7 +250,7 @@ def freeze(
             if name not in exclude:
                 pkgs[name] = m.group(2)
 
-    log.info("Frozen %d packages (excluded pip-audit tooling)", len(pkgs))
+    log.info("Frozen %d packages", len(pkgs))
     return pkgs
 
 

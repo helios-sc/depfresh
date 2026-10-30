@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from pathlib import Path
 
-from depfresh.models import ImportCheck, PackageChange, Vulnerability
+from depfresh.models import ImportCheck, PackageChange, UpgradeResult, Vulnerability
 from depfresh.reports import write_log, write_markdown
 from tests.helpers import make_result as _make_report
 
@@ -113,3 +113,71 @@ class TestWriteMarkdown:
         content = path.read_text()
         assert "Reason" in content
         assert "major upgrade" in content.lower()
+
+
+class TestImportRegressionReporting:
+    def _report(self) -> UpgradeResult:
+        return _make_report(
+            import_check_baseline=ImportCheck(verified=["fastmcp", "fastmcp.tools.tool"]),
+            import_check=ImportCheck(
+                verified=["fastmcp"],
+                failed={"fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'"},
+            ),
+            import_regressions={"fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'"},
+            write_back_skipped="1 import(s) resolved before the upgrade and fail after it",
+        )
+
+    def test_markdown_lists_regressions_and_unwritten_file(self, tmp_path: Path) -> None:
+        report = self._report()
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "Regressions (1)" in content
+        assert "`fastmcp.tools.tool`" in content
+        assert "- [ ] Dependency file updated: no (1 import(s)" in content
+        assert "- [ ] Import verification: **1 regressions**" in content
+
+    def test_log_lists_regressions(self, tmp_path: Path) -> None:
+        report = self._report()
+        content = write_log(report, tmp_path, "2026-01-15").read_text()
+        assert "REGRESSIONS (1)" in content
+        assert "Import regressions: 1" in content
+
+
+
+class TestAccurateSummary:
+    """The PR text said "no major version changes" while the manifest changed."""
+
+    def test_reports_majors_that_actually_happened(self, tmp_path: Path) -> None:
+        report = _make_report(
+            upgraded=[
+                PackageChange("cryptography", "46.0.6", "50.0.2", is_security_fix=True),
+                PackageChange("idna", "3.11", "3.15"),
+            ],
+        )
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "1 across a major version** (cryptography)" in content
+        assert "no major version changes" not in content
+
+    def test_reports_downgrades(self, tmp_path: Path) -> None:
+        report = _make_report(
+            upgraded=[PackageChange("google-cloud-storage", "3.17.1", "2.19.0")],
+        )
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "1 downgraded** (google-cloud-storage)" in content
+
+    def test_manifest_diff_is_shown_even_without_version_changes(self, tmp_path: Path) -> None:
+        diff = (
+            "--- a/pyproject.toml\n+++ b/pyproject.toml\n@@ -1 +1 @@\n"
+            '-    "fastapi>=0.115",\n+    "fastapi>=0.162.0",\n'
+        )
+        report = _make_report(
+            requirements_path="pyproject.toml", manifest_diff=diff, dep_file_updated=True,
+        )
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "No package versions changed." in content
+        assert "## Files Changed" in content
+        assert '+    "fastapi>=0.162.0",' in content
+
+    def test_unwritten_diff_is_labelled(self, tmp_path: Path) -> None:
+        report = _make_report(manifest_diff="-a\n+b\n", dry_run=True)
+        content = write_markdown(report, tmp_path, "2026-01-15").read_text()
+        assert "(not written (dry run)); the change would be:" in content

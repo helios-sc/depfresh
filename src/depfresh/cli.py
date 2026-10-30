@@ -7,9 +7,11 @@ import logging
 import sys
 import textwrap
 
+from depfresh.advisories import DEFAULT_PLATFORM
 from depfresh.exceptions import DepfreshError
+from depfresh.models import UpgradeResult
 from depfresh.parsers import _FORMAT_CHOICES
-from depfresh.upgrade import upgrade
+from depfresh.upgrade import audit_only, upgrade
 
 
 def _setup_logging(verbose: bool = False) -> None:
@@ -33,8 +35,17 @@ def main(argv: list[str] | None = None) -> None:
         ),
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
+            exit codes:
+              0  no known vulnerabilities remain
+              1  error (nothing written)
+              2  vulnerabilities remain
+              3  imports that resolved before the upgrade fail after it (nothing written)
+
             examples:
               depfresh /path/to/project
+              depfresh /path/to/project --audit-only
+              depfresh /path/to/project --extra full --extra gcs
+              depfresh /path/to/project --allow-major cryptography --python 3.12
               depfresh /path/to/project --label my_service
               depfresh /path/to/project --python 3.12
               depfresh /path/to/project --dry-run
@@ -73,7 +84,44 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument(
         "--python", default="3.11", dest="python_version",
-        help="Python version for the venv (default: 3.11)",
+        help="Deploy Python version to resolve and audit for (default: 3.11)",
+    )
+    parser.add_argument(
+        "--platform", default=DEFAULT_PLATFORM,
+        help=(
+            "Deploy platform to resolve and audit for, as a uv --python-platform name "
+            f"(default: {DEFAULT_PLATFORM})"
+        ),
+    )
+    parser.add_argument(
+        "--strategy", choices=("minimal", "latest"), default="minimal",
+        help=(
+            "'minimal' (default): move only vulnerable packages, each to the lowest "
+            "release that fixes all of its advisories. 'latest': upgrade every package "
+            "to its newest release within the current major (resolved on this machine)."
+        ),
+    )
+    parser.add_argument(
+        "--extra", action="append", default=None, dest="extras", metavar="NAME",
+        help=(
+            "Optional-dependency group that ships (repeatable or comma-separated). "
+            "Default: the extras a local Dockerfile installs, else none."
+        ),
+    )
+    parser.add_argument(
+        "--all-extras", action="store_true",
+        help="Every optional-dependency group ships",
+    )
+    parser.add_argument(
+        "--group", action="append", default=None, dest="groups", metavar="NAME",
+        help=(
+            "uv projects: dependency group that ships (repeatable). "
+            "Default: every group except dev (uv export --no-dev)."
+        ),
+    )
+    parser.add_argument(
+        "--all-groups", action="store_true",
+        help="uv projects: every dependency group ships",
     )
     parser.add_argument(
         "--venv", default=".venv-upgrade", dest="venv_name",
@@ -102,6 +150,24 @@ def main(argv: list[str] | None = None) -> None:
         help="Show what would change without writing the dependency file",
     )
     parser.add_argument(
+        "--audit-only", action="store_true",
+        help="Audit what ships and show the fix plan; change nothing",
+    )
+    parser.add_argument(
+        "--repo-advisories", action="store_true",
+        help=(
+            "Also check the GitHub repository advisories of every shipped package, which "
+            "reach the GitHub Advisory Database late (needs an authenticated gh CLI)"
+        ),
+    )
+    parser.add_argument(
+        "--skip-import-check", action="store_true",
+        help=(
+            "Do not install the before/after sets on this machine to compare imports "
+            "(faster; the write-back is then not gated on imports)"
+        ),
+    )
+    parser.add_argument(
         "--allow-major", nargs="*", default=None, metavar="PKG",
         help=(
             "Allow major version upgrades. No args = all packages. "
@@ -117,6 +183,13 @@ def main(argv: list[str] | None = None) -> None:
         help="Directory for report output (default: ./reports/)",
     )
     parser.add_argument(
+        "--uv", default=None, dest="uv_binary", metavar="PATH",
+        help=(
+            "uv binary to use (default: $DEPFRESH_UV, then a uv in depfresh's own "
+            "environment, then PATH; it must be at least the supported minimum)"
+        ),
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable debug output",
     )
@@ -125,35 +198,78 @@ def main(argv: list[str] | None = None) -> None:
     _setup_logging(verbose=args.verbose)
 
     try:
-        result = upgrade(
-            target=args.target_dir,
-            label=args.label,
-            dep_file=args.dep_file,
-            fmt=args.fmt,
-            python=args.python_version,
-            venv_name=args.venv_name,
-            dependency_scope=args.dependency_scope,
-            ignore_direct_references=args.ignore_direct_references,
-            dry_run=args.dry_run,
-            allow_major=args.allow_major,
-            keep_version=args.keep_version,
-            reports_dir=args.reports_dir,
-        )
-    except DepfreshError as exc:
+        if args.audit_only:
+            result = audit_only(
+                target=args.target_dir,
+                dep_file=args.dep_file,
+                fmt=args.fmt,
+                python=args.python_version,
+                dependency_scope=args.dependency_scope,
+                ignore_direct_references=args.ignore_direct_references,
+                uv_binary=args.uv_binary,
+                extras=args.extras,
+                all_extras=args.all_extras,
+                groups=args.groups,
+                all_groups=args.all_groups,
+                platform=args.platform,
+                repo_advisories=args.repo_advisories,
+            )
+        else:
+            result = upgrade(
+                target=args.target_dir,
+                label=args.label,
+                dep_file=args.dep_file,
+                fmt=args.fmt,
+                python=args.python_version,
+                venv_name=args.venv_name,
+                dependency_scope=args.dependency_scope,
+                ignore_direct_references=args.ignore_direct_references,
+                dry_run=args.dry_run,
+                allow_major=args.allow_major,
+                keep_version=args.keep_version,
+                reports_dir=args.reports_dir,
+                uv_binary=args.uv_binary,
+                strategy=args.strategy,
+                extras=args.extras,
+                all_extras=args.all_extras,
+                groups=args.groups,
+                all_groups=args.all_groups,
+                platform=args.platform,
+                import_check=not args.skip_import_check,
+                repo_advisories=args.repo_advisories,
+            )
+    except (DepfreshError, ValueError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         sys.exit(1)
+
+    if args.audit_only:
+        _print_audit(result)
+        return
 
     # Print final summary to stdout
     print()
     print(f"depfresh — {result.service_label}")
     print("=" * 60)
     print(f"  Dep file:     {result.requirements_path}")
+    print(f"  Mode:         {result.mode} ({result.strategy})")
+    if result.platform:
+        print(f"  Target:       {result.platform}, Python {result.python_version}")
     print(f"  Packages:     {result.original_count} -> {result.final_count}")
     print(f"  Upgraded:     {len(result.upgraded)}")
     print(f"  New deps:     {len(result.new_deps)}")
     print(f"  Scope:        {result.dependency_scope}")
     print(f"  Vulns before: {len(result.pre_audit_vulns)}")
     print(f"  Vulns after:  {len(result.post_audit_vulns)}")
+    _print_audit_coverage(result)
+    if result.files_changed:
+        state = "written" if result.dep_file_updated else "not written"
+        print(f"  Files:        {', '.join(result.files_changed)} ({state})")
+    if result.lock_check:
+        print(f"  Lock check:   {result.lock_check}")
+    if result.resolution_check:
+        print(f"  Resolution:   {result.resolution_check}")
+    if result.write_back_skipped:
+        print(f"  Write-back:   skipped ({result.write_back_skipped})")
     if result.direct_references_ignored:
         print(f"  Direct refs:  ignored ({len(result.direct_references_ignored)})")
     if result.log_path:
@@ -161,11 +277,105 @@ def main(argv: list[str] | None = None) -> None:
     if result.markdown_path:
         print(f"  Report:       {result.markdown_path}")
 
-    if result.post_audit_vulns:
-        print(f"\n  WARNING: {len(result.post_audit_vulns)} vulnerabilities remain.")
+    if result.import_regressions:
+        print(
+            f"\n  ERROR: {len(result.import_regressions)} import(s) resolved before the "
+            "upgrade and fail after it:"
+        )
+        for mod, err in result.import_regressions.items():
+            print(f"    {mod}: {err}")
+        print("  The dependency file was not written.")
+        sys.exit(3)
+    code, lines = outcome_message(result)
+    print()
+    for line in lines:
+        print(f"  {line}")
+    if code:
+        sys.exit(code)
+
+
+def _print_audit_coverage(result: UpgradeResult) -> None:
+    """How much of the shipped set was audited, when not all of it was."""
+    if result.not_audited:
+        audited = "?" if result.audited_count is None else str(result.audited_count)
+        print(f"  Audited:      {audited} packages; {len(result.not_audited)} not audited "
+              "(private index, local or direct references; listed in the report)")
+    if result.other_index:
+        urls = ", ".join(sorted(set(result.other_index.values())))
+        print(f"  Other index:  {len(result.other_index)} audited packages come from {urls}, "
+              "not PyPI (see the report)")
+
+
+def coverage_message(result: UpgradeResult) -> tuple[int, list[str]] | None:
+    """The closing lines when part (or all) of the shipped set went unaudited.
+
+    Never a clean result: with nothing audited the run exits 2, and with some
+    packages unaudited the message says how many.
+    """
+    if not result.not_audited:
+        return None
+    unaudited = len(result.not_audited)
+    if result.audited_count == 0:
+        return 2, [f"NOTHING WAS AUDITED: none of the shipped packages could be audited "
+                   f"({unaudited} not audited; listed in the report)."]
+    return 0, [f"No known vulnerabilities in the {result.audited_count} audited packages; "
+               f"{unaudited} shipped packages were not audited (listed in the report)."]
+
+
+def outcome_message(result: UpgradeResult) -> tuple[int, list[str]]:
+    """The exit code and closing lines for an upgrade run (import regressions aside).
+
+    The code describes the files on disk: when nothing was written (a dry run,
+    or a write-back withheld by a failed check) the vulnerabilities found before
+    the run are still there, so the run exits 2 if there were any.  A run that
+    left part of the shipped set unaudited never reports clean.
+    """
+    before, after = len(result.pre_audit_vulns), len(result.post_audit_vulns)
+    if result.write_back_skipped:
+        return 2, [
+            f"NOTHING WAS WRITTEN: {result.write_back_skipped}.",
+            f"The files on disk still have the {before} vulnerabilities found before the "
+            f"run; the planned changes would have left {after}.",
+        ]
+    planned = bool(result.files_changed or result.manifest_diff)
+    if result.dry_run and planned:
+        return (2 if before else 0), [
+            f"DRY RUN: nothing was written. {before} vulnerabilities in the files on disk; "
+            f"the planned changes would leave {after}.",
+        ]
+    if after:
+        return 2, [f"WARNING: {after} vulnerabilities remain."]
+    coverage = coverage_message(result)
+    if coverage is not None:
+        return coverage
+    return 0, ["All vulnerabilities resolved!"]
+
+
+def _print_audit(result: UpgradeResult) -> None:
+    """Summary of an --audit-only run; exits 2 when vulnerabilities are found."""
+    print()
+    print(f"depfresh audit — {result.service_label}")
+    print("=" * 60)
+    print(f"  Dep file:     {result.requirements_path} ({result.mode})")
+    if result.platform:
+        print(f"  Target:       {result.platform}, Python {result.python_version}")
+    print(f"  Packages:     {result.original_count}")
+    print(f"  Vulns:        {len(result.pre_audit_vulns)}")
+    for fix in result.fixes:
+        target = fix.target or "-"
+        print(f"    {fix.package} {fix.current} -> {target} [{fix.status}] {fix.reason}")
+    for line in result.not_audited:
+        print(f"  Not audited:  {line}")
+    _print_audit_coverage(result)
+    if result.pre_audit_vulns:
         sys.exit(2)
-    else:
-        print("\n  All vulnerabilities resolved!")
+    coverage = coverage_message(result)
+    if coverage is not None:
+        print()
+        for line in coverage[1]:
+            print(f"  {line}")
+        if coverage[0]:
+            sys.exit(coverage[0])
 
 
 if __name__ == "__main__":

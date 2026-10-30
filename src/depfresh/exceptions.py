@@ -8,11 +8,25 @@ class DepfreshError(Exception):
 
 
 class UvNotFoundError(DepfreshError):
-    """Raised when the ``uv`` binary cannot be found on PATH."""
+    """Raised when the ``uv`` binary cannot be found."""
 
-    def __init__(self) -> None:
+    def __init__(self, message: str | None = None) -> None:
         super().__init__(
-            "'uv' is not installed. Install it from https://docs.astral.sh/uv/"
+            message or "'uv' is not installed. Install it from https://docs.astral.sh/uv/"
+        )
+
+
+class UvVersionError(DepfreshError):
+    """Raised when every ``uv`` binary found is older than depfresh's minimum."""
+
+    def __init__(self, found: list[tuple[str, str]], minimum: str) -> None:
+        self.found = found
+        self.minimum = minimum
+        listing = ", ".join(f"uv {version} at {path}" for path, version in found)
+        super().__init__(
+            f"depfresh needs uv >= {minimum}, found {listing}. Upgrade uv "
+            "(https://docs.astral.sh/uv/) or point depfresh at a newer binary "
+            "with --uv or DEPFRESH_UV."
         )
 
 
@@ -62,4 +76,23 @@ class DirectReferenceError(DepfreshError):
             "Direct references are not supported by default in "
             f"{path}: {joined}. Re-run with --ignore-direct-references "
             "to skip them."
+        )
+
+
+class PrivateIndexError(DepfreshError):
+    """Raised when uv cannot reach a non-PyPI package index.
+
+    depfresh never falls back to public PyPI for a package that belongs to a
+    private index: that would be a dependency-confusion exposure.
+    """
+
+    def __init__(self, url: str, detail: str = "") -> None:
+        self.url = url
+        self.detail = detail
+        tail = f"\n{detail.strip()[-500:]}" if detail.strip() else ""
+        super().__init__(
+            f"Could not reach the package index {url}. depfresh does not fall back to "
+            "public PyPI for packages from a private index; make the index reachable "
+            "(network access, keyring or UV_INDEX_<NAME>_USERNAME/PASSWORD credentials) "
+            f"and re-run.{tail}"
         )

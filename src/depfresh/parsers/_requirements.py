@@ -17,6 +17,7 @@ from depfresh.parsers._helpers import (
     _format_requirement,
     _update_specifier_string,
 )
+from depfresh.textio import read_text, read_text_file, write_text_like
 
 log = logging.getLogger("depfresh")
 
@@ -40,9 +41,56 @@ class RequirementsSimpleHandler:
         return _inspect_requirements_file(path)
 
     def write(self, pkgs: dict[str, str], path: Path, **kwargs: Any) -> None:
-        lines = [name if ver == "*" else f"{name}=={ver}" for name, ver in sorted(pkgs.items())]
-        path.write_text("\n".join(lines) + "\n")
-        log.debug("Wrote requirements: %s (%d packages)", path, len(lines))
+        """Update the listed requirements to the versions in *pkgs*, in place.
+
+        Only lines of packages in *pkgs* whose version changes are touched: a
+        pin moves (``==``), a floor is raised (``>=``); comments, markers,
+        ordering, unlisted packages and every other line stay as they are.
+        A file that does not exist yet is written as sorted ``name==version``
+        lines.
+        """
+        if not path.exists():
+            lines = [name if ver == "*" else f"{name}=={ver}" for name, ver in sorted(pkgs.items())]
+            path.write_text("\n".join(lines) + "\n")
+            log.debug("Wrote requirements: %s (%d packages)", path, len(lines))
+            return
+        from depfresh.advisories import TargetEnv
+        from depfresh.constraints import admit_version
+        from depfresh.pipmode import RequirementsDocument, check_unambiguous
+
+        original = read_text_file(path)
+        python = str(kwargs.get("python_version") or "3.11")
+        doc = RequirementsDocument(original.text, env=TargetEnv.host(python))
+        check_unambiguous(doc, [name for name in pkgs if name in doc.ambiguous])
+        changed = 0
+        for name, spec in doc.listed().items():
+            new_ver = pkgs.get(name)
+            if not new_ver or new_ver == "*":
+                continue
+            pinned = spec.startswith("==") and "," not in spec and "*" not in spec
+            if pinned:
+                if spec[2:] == new_ver:
+                    continue
+                new_spec = f"=={new_ver}"
+            elif _admits(spec, new_ver):
+                continue  # a floor that already admits the version is left alone
+            else:
+                new_spec = admit_version(spec, new_ver)
+            doc.set_spec(name, new_spec)
+            changed += 1
+        write_text_like(path, doc.render(), original)
+        log.debug("Updated %d requirement line(s) in %s", changed, path)
+
+
+def _admits(spec: str, version: str) -> bool:
+    """True when the specifier *spec* already allows *version*."""
+    from packaging.specifiers import InvalidSpecifier, SpecifierSet
+    from packaging.version import InvalidVersion
+
+    try:
+        return SpecifierSet(spec).contains(version, prereleases=True)
+    except (InvalidSpecifier, InvalidVersion):
+        return True
 
 
 # ---------------------------------------------------------------------------
@@ -98,7 +146,8 @@ class RequirementsInHandler:
         Preserves comments and non-requirement lines.  For requirement
         lines, updates the version specifier with ``>=new_version``.
         """
-        original_lines = path.read_text().splitlines()
+        original = read_text_file(path)
+        original_lines = original.text.splitlines()
         new_lines: list[str] = []
 
         for line in original_lines:
@@ -131,7 +180,7 @@ class RequirementsInHandler:
             else:
                 new_lines.append(line)
 
-        path.write_text("\n".join(new_lines) + "\n")
+        write_text_like(path, "\n".join(new_lines) + "\n", original)
         log.debug("Wrote requirements.in: %s (%d packages)", path, len(pkgs))
 
 
@@ -140,74 +189,56 @@ class RequirementsInHandler:
 # ---------------------------------------------------------------------------
 
 _PIP_DIRECTIVE_PATTERNS: dict[str, str] = {
-    "-r ": "File inclusion (-r) is not followed \u2014 "
-           "dependencies from the referenced file will not be processed",
-    "--requirement ": "File inclusion (--requirement) is not followed \u2014 "
-                      "dependencies from the referenced file will not be processed",
-    "-c ": "Constraint file (-c) is not applied \u2014 "
-           "constraints from the referenced file will not be enforced",
-    "--constraint ": "Constraint file (--constraint) is not applied \u2014 "
-                     "constraints from the referenced file will not be enforced",
-    "--index-url ": "Custom index (--index-url) is ignored \u2014 "
-                    "depfresh uses the default PyPI index (or uv\u2019s configured index)",
-    "--extra-index-url ": "Extra index (--extra-index-url) is ignored \u2014 "
-                          "packages from this index may not be found",
-    "--find-links ": "Find-links directive is ignored",
-    "--trusted-host ": "Trusted-host directive is ignored",
-    "--no-binary ": "no-binary directive is ignored",
-    "--only-binary ": "only-binary directive is ignored",
+    "-r ": "Included file (-r): this reader lists only this file's own requirements; "
+           "depfresh inspects the included file before uv resolves it",
+    "--requirement ": "Included file (--requirement): this reader lists only this file's own "
+                      "requirements; depfresh inspects the included file before uv resolves it",
+    "-c ": "Constraint file (-c): depfresh inspects it, and uv applies it when resolving",
+    "--constraint ": "Constraint file (--constraint): depfresh inspects it, and uv applies it "
+                     "when resolving",
+    "--index-url ": "Custom index (--index-url): uv resolves against it; packages from it "
+                    "are audited as public packages",
+    "--extra-index-url ": "Extra index (--extra-index-url): uv also resolves against it; "
+                          "packages from it are audited as public packages",
+    "--trusted-host ": "Trusted-host directive is passed to uv unchanged",
+    "--no-binary ": "no-binary directive is passed to uv unchanged",
+    "--only-binary ": "only-binary directive is passed to uv unchanged",
 }
 
 
 def _inspect_requirements_file(path: Path) -> DependencyInspection:
-    """Inspect a requirements-style file line-by-line."""
-    inspection = DependencyInspection()
-    lines = _merge_continuation_lines(path.read_text().splitlines())
+    """Inspect a requirements-style file, classifying every line like pip does.
 
-    for stripped in lines:
-        if not stripped or stripped.startswith("#"):
-            continue
-        if stripped.startswith(("-e ", "--editable ", "git+")):
+    Lines uv would fetch from a path, archive, VCS or URL (and lines that do
+    not parse) are direct references.  Included files are not listed here;
+    :func:`depfresh.reqlines.inspect_tree` follows them.
+    """
+    from depfresh.reqlines import parse_lines
+
+    inspection = DependencyInspection()
+    for line in parse_lines(read_text(path)):
+        if line.kind == "direct":
             inspection.direct_references.append(DependencySpec(
-                name="",
-                version="",
-                requirement="",
-                raw=stripped,
-                source_kind="direct-reference",
-                group="runtime",
-                is_runtime=True,
+                name="", version="", requirement="", raw=line.requirement or line.code,
+                source_kind="direct-reference", group="runtime", is_runtime=True,
             ))
-            continue
-        if stripped.startswith("-"):
-            _warn_pip_directive(stripped, path)
-            continue
-        base = stripped.split(" --hash=", 1)[0].strip()
-        if not base or base.startswith("--hash="):
-            continue
-        try:
-            req = Requirement(base)
-        except InvalidRequirement:
-            continue
-        dep = _dependency_from_requirement(
-            req,
-            raw=base,
-            group="runtime",
-            is_runtime=True,
-        )
-        if dep.source_kind == "direct-reference":
-            inspection.direct_references.append(dep)
-        else:
-            inspection.registry.append(dep)
+        elif line.kind in ("option", "include"):
+            _warn_pip_directive(line.code, path)
+        elif line.kind == "registry":
+            req = Requirement(line.requirement)
+            inspection.registry.append(_dependency_from_requirement(
+                req, raw=line.requirement, group="runtime", is_runtime=True,
+            ))
     return inspection
 
 
 def _warn_pip_directive(line: str, path: Path) -> None:
-    """Emit a warning when a pip directive is silently skipped."""
+    """Emit a warning for pip directives whose handling is worth knowing."""
     for prefix, message in _PIP_DIRECTIVE_PATTERNS.items():
         if line.startswith(prefix) or line.startswith("-" + prefix.lstrip("-")):
             log.warning("%s: %s: %s", path.name, message, line)
             return
-    log.debug("%s: skipping unsupported pip option: %s", path.name, line)
+    log.debug("%s: pip option passed to uv: %s", path.name, line)
 
 
 def _merge_continuation_lines(raw_lines: list[str]) -> list[str]:

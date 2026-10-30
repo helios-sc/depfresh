@@ -1,4 +1,24 @@
-"""AST-based import verification against the upgraded environment."""
+"""AST-based import verification against the upgraded environment.
+
+Imports are read from the project's ``.py`` files with :mod:`ast` (no project
+code runs) and then *located* — not imported — in the target venv: the
+top-level name with :func:`importlib.util.find_spec`, each submodule with a
+:class:`importlib.machinery.FileFinder` inside its parent's search path.  No
+third-party module code runs either, and one missing module cannot abort the
+check for the others.
+
+The venv's interpreter runs as ``python -I -S`` from an empty temporary
+directory: ``-I`` keeps the working directory, ``PYTHON*`` variables and the
+user site out of ``sys.path``, and ``-S`` skips :mod:`site`, so no ``.pth``
+hook of an installed package runs.  The check adds the venv's site-packages
+itself and reads each ``.pth`` file as text, taking its path entries and
+ignoring its ``import`` lines.  Only the standard library executes.
+
+Because a project usually has some imports that never resolve (test-only
+tools, optional extras, modules put on ``sys.path`` at runtime), the result is
+only meaningful relative to a baseline: :func:`import_regressions` reports the
+modules that resolved before the upgrade and fail after it.
+"""
 
 from __future__ import annotations
 
@@ -6,8 +26,10 @@ import ast
 import json
 import logging
 import subprocess
+import tempfile
 import textwrap
 import warnings
+from dataclasses import dataclass, field
 from pathlib import Path
 
 from depfresh.models import ImportCheck
@@ -16,38 +38,48 @@ log = logging.getLogger("depfresh")
 
 _SKIP_DIRS = {
     "__pycache__", ".git", ".tox", ".mypy_cache", ".pytest_cache", "node_modules",
+    "site-packages", "dist-packages",
 }
 
 
-def verify_imports(target_dir: Path, venv_python: str) -> ImportCheck:
-    """Verify that third-party imports from the codebase resolve in the upgraded venv.
+def verify_imports(target_dir: Path, venv_python: str, *, label: str = "upgraded") -> ImportCheck:
+    """Verify that third-party imports from the codebase resolve in a venv.
 
     Scans all ``.py`` files under *target_dir*, classifies imports into
     stdlib / local / third-party, then checks that every third-party import
-    is resolvable in the venv without actually importing it (safe for
-    packages with side-effects or missing configs).
+    is resolvable in the venv without importing it (safe for packages with
+    side effects or missing configuration).
+
+    Args:
+        target_dir: Project directory to scan.
+        venv_python: Interpreter of the environment to check against.
+        label: Which environment this is, for logging (``"baseline"``…).
     """
-    log.info("Verifying imports against upgraded environment")
+    log.info("Verifying imports against the %s environment", label)
 
     # 1. Extract imports from Python files
     all_imports, files_scanned = _extract_imports(target_dir)
     log.info("Scanned %d Python files, found %d unique imports", files_scanned, len(all_imports))
 
     # 2. Identify local and stdlib modules
-    local_modules = _find_local_modules(target_dir)
+    local_modules = LocalModules.of(target_dir)
     stdlib_modules = _get_stdlib_modules(venv_python)
 
     # 3. Classify imports
     local_skipped: set[str] = set()
     third_party: set[str] = set()
+    either: set[str] = set()   # a bare name of a local namespace directory
     for imp in all_imports:
         top = imp.split(".")[0]
-        if top in local_modules:
+        where = local_modules.classify(imp)
+        if where == "local":
             local_skipped.add(top)
         elif top in stdlib_modules:
             pass
         else:
             third_party.add(imp)
+            if where == "either":
+                either.add(imp)
 
     log.info(
         "Third-party: %d, local: %d, stdlib: %d",
@@ -65,6 +97,11 @@ def verify_imports(target_dir: Path, venv_python: str) -> ImportCheck:
 
     # 4. Batch import check in the venv
     results, warns = _batch_import_check(venv_python, third_party)
+    for mod in sorted(either):
+        # Not in the venv either: the local namespace directory is what it imports.
+        if results.get(mod) is not None:
+            del results[mod]
+            local_skipped.add(mod.split(".")[0])
 
     verified = sorted(mod for mod, err in results.items() if err is None)
     failed = {mod: err for mod, err in sorted(results.items()) if err is not None}
@@ -99,7 +136,7 @@ def _extract_imports(target_dir: Path) -> tuple[set[str], int]:
     files_scanned = 0
     for py_file in target_dir.rglob("*.py"):
         rel_parts = py_file.relative_to(target_dir).parts
-        if any(p in _SKIP_DIRS or p.startswith((".venv", "venv")) for p in rel_parts):
+        if any(_is_skipped_dir(p) for p in rel_parts[:-1]):
             continue
         try:
             with warnings.catch_warnings():
@@ -121,29 +158,132 @@ def _extract_imports(target_dir: Path) -> tuple[set[str], int]:
     return imports, files_scanned
 
 
+@dataclass
+class LocalModules:
+    """The project's own top-level modules, as its import roots expose them.
+
+    The import roots are the project directory and ``src/``: only what sits
+    directly in one of them is importable by a bare name.  A module deeper in
+    the tree (``app/integrations/google/``) is ``app.integrations.google`` and
+    never hides a third-party ``google``.
+
+    Attributes:
+        regular: ``.py`` modules and packages with an ``__init__.py`` at a root,
+            and the project directory's own name.
+        namespaces: Directories without ``__init__.py`` at a root.  Python merges
+            such a namespace with same-named ones in site-packages, and a
+            regular package there wins over it, so ``google.cloud`` stays
+            third-party when the local ``google/`` has no ``cloud``, and a bare
+            ``alembic`` next to an ``alembic/`` migrations directory may well be
+            the third-party package.
+    """
+
+    regular: set[str] = field(default_factory=set)
+    namespaces: dict[str, list[Path]] = field(default_factory=dict)
+
+    @classmethod
+    def of(cls, target_dir: Path) -> LocalModules:
+        found = cls(regular={target_dir.name})
+        roots = [target_dir, *([target_dir / "src"] if (target_dir / "src").is_dir() else [])]
+        for root in roots:
+            for item in sorted(root.iterdir()):
+                if item.is_file() and item.suffix == ".py" and item.stem != "__init__":
+                    found.regular.add(item.stem)
+                elif item.is_dir() and not _is_skipped_dir(item.name):
+                    if (item / "__init__.py").is_file():
+                        found.regular.add(item.name)
+                    else:
+                        found.namespaces.setdefault(item.name, []).append(item)
+        return found
+
+    def classify(self, module: str) -> str:
+        """``"local"``, ``"other"`` (stdlib or third-party), or ``"either"``.
+
+        ``"either"`` is the bare name of a local namespace directory: the venv
+        decides (a third-party package of that name wins; otherwise it is local).
+        """
+        parts = module.split(".")
+        if parts[0] in self.regular:
+            return "local"
+        if parts[0] not in self.namespaces:
+            return "other"
+        if len(parts) == 1:
+            return "either"
+        if any((d / parts[1]).is_dir() or (d / f"{parts[1]}.py").is_file()
+               for d in self.namespaces[parts[0]]):
+            return "local"
+        return "other"
+
+    def provides(self, module: str) -> bool:
+        """True when *module* certainly resolves to the project's own code."""
+        return self.classify(module) == "local"
+
+    def names(self) -> set[str]:
+        return self.regular | set(self.namespaces)
+
+
 def _find_local_modules(target_dir: Path) -> set[str]:
-    """Identify local package/module names in *target_dir* (not third-party)."""
-    local: set[str] = set()
-    local.add(target_dir.name)
-    for item in target_dir.iterdir():
-        if item.name.startswith("."):
-            continue
-        if item.is_dir() and not item.name.startswith(("venv", ".venv")):
-            local.add(item.name)
-            for sub in item.iterdir():
-                if sub.is_dir() and not sub.name.startswith((".", "_")):
-                    local.add(sub.name)
-        elif item.is_file() and item.suffix == ".py":
-            local.add(item.stem)
-    return local
+    """Top-level names the project's import roots provide (see :class:`LocalModules`)."""
+    return LocalModules.of(target_dir).names()
+
+
+def _is_skipped_dir(name: str) -> bool:
+    """Return True for directories that never hold project modules."""
+    return (
+        name in _SKIP_DIRS
+        or name.startswith((".", "venv"))
+    )
+
+
+def import_regressions(baseline: ImportCheck, after: ImportCheck) -> dict[str, str]:
+    """Return the modules that resolved in *baseline* but fail in *after*.
+
+    Args:
+        baseline: Import check against the environment before the upgrade.
+        after: Import check against the upgraded environment.
+
+    Returns:
+        ``{module: error}`` for every regression, sorted by module name.
+    """
+    resolved_before = set(baseline.verified)
+    return {
+        mod: err for mod, err in sorted(after.failed.items()) if mod in resolved_before
+    }
+
+
+def _run_isolated(
+    venv_python: str, script: str, *args: str, timeout: int,
+) -> subprocess.CompletedProcess[str]:
+    """``python -I -S -c script`` from an empty directory: only the stdlib runs."""
+    with tempfile.TemporaryDirectory(prefix="depfresh-check-") as empty:
+        return subprocess.run(
+            [venv_python, "-I", "-S", "-c", script, *args],
+            capture_output=True, text=True, timeout=timeout, cwd=empty,
+        )
+
+
+def site_dirs(venv_python: str) -> list[str]:
+    """The site-packages directories of the venv *venv_python* belongs to.
+
+    Found from the venv layout, not by asking the interpreter: with ``-S``
+    it does not know about its venv, and without it every ``.pth`` hook runs.
+    """
+    venv = Path(venv_python).parent.parent
+    found: list[str] = []
+    for pattern in ("lib/python*/site-packages", "lib64/python*/site-packages",
+                    "Lib/site-packages"):
+        for path in sorted(venv.glob(pattern)):
+            resolved = str(path.resolve())
+            if path.is_dir() and resolved not in found:
+                found.append(resolved)
+    return found
 
 
 def _get_stdlib_modules(venv_python: str) -> set[str]:
     """Get stdlib module names from the venv Python."""
-    result = subprocess.run(
-        [venv_python, "-c",
-         "import sys, json; print(json.dumps(sorted(sys.stdlib_module_names)))"],
-        capture_output=True, text=True, timeout=30,
+    result = _run_isolated(
+        venv_python, "import sys, json; print(json.dumps(sorted(sys.stdlib_module_names)))",
+        timeout=30,
     )
     if result.returncode == 0 and result.stdout.strip():
         return set(json.loads(result.stdout.strip()))
@@ -153,69 +293,113 @@ def _get_stdlib_modules(venv_python: str) -> set[str]:
 def _batch_import_check(
     venv_python: str, modules: set[str],
 ) -> tuple[dict[str, str | None], dict[str, list[str]]]:
-    """Verify that third-party modules are available in the venv.
+    """Check that third-party modules can be located in the venv.
 
-    Uses ``importlib.metadata.packages_distributions()`` (Python 3.11+) to
-    check package availability without actually importing — avoids crashes
-    from missing configs, C-extension segfaults, or side-effects during
-    import.  Falls back to ``importlib.import_module()`` only for modules
-    not found in the metadata map.
+    Each module is resolved on its own, inside its own ``try``: the top-level
+    name with :func:`importlib.util.find_spec`, which searches ``sys.path``
+    without importing anything, then each dotted part with a
+    :class:`importlib.machinery.FileFinder` over the parent's
+    ``submodule_search_locations`` (namespace packages such as ``google.cloud``
+    included).  Unlike ``find_spec("pkg.sub")``, that never imports ``pkg`` (no
+    module code runs) and a missing ``pkg`` fails only ``pkg.sub`` instead of
+    the whole batch.
 
     Returns ``(results, warnings)`` where:
       - results: ``{module: error_string_or_None}``
-      - warnings: ``{module: [warning_messages]}``
+      - warnings: ``{module: [warning_messages]}`` (always empty: nothing is
+        imported, so no import-time warnings are raised)
     """
     if not modules:
         return {}, {}
 
     check_script = textwrap.dedent("""\
-        import sys, json, importlib, importlib.metadata, importlib.util, warnings
+        import importlib.machinery as machinery
+        import importlib.util
+        import json
+        import os
+        import sys
 
-        modules = json.loads(sys.argv[1])
+        def add_site_dir(sitedir):
+            # site.addsitedir() without running anything: .pth path entries
+            # are added, "import" lines are skipped.
+            if sitedir not in sys.path:
+                sys.path.append(sitedir)
+            try:
+                names = sorted(os.listdir(sitedir))
+            except OSError:
+                return
+            for name in names:
+                if not name.endswith(".pth") or name.startswith("."):
+                    continue
+                try:
+                    with open(os.path.join(sitedir, name), encoding="utf-8") as handle:
+                        lines = handle.read().splitlines()
+                except (OSError, UnicodeDecodeError):
+                    continue
+                for line in lines:
+                    line = line.rstrip()
+                    if not line or line.startswith(("#", "import ", "import\t")):
+                        continue
+                    path = os.path.abspath(os.path.join(sitedir, line))
+                    if os.path.exists(path) and path not in sys.path:
+                        sys.path.append(path)
 
-        # Map of importable top-level names -> distribution packages (safe, no side-effects)
-        try:
-            pkg_map = importlib.metadata.packages_distributions()
-        except AttributeError:
-            pkg_map = {}  # Python < 3.11 fallback
+        for sitedir in json.loads(sys.argv[2]):
+            add_site_dir(sitedir)
+
+        LOADERS = [
+            (machinery.ExtensionFileLoader, machinery.EXTENSION_SUFFIXES),
+            (machinery.SourceFileLoader, machinery.SOURCE_SUFFIXES),
+            (machinery.SourcelessFileLoader, machinery.BYTECODE_SUFFIXES),
+        ]
+
+        def child(fullname, locations):
+            # FileFinder per directory: unlike PathFinder it never builds a
+            # _NamespacePath, which needs the parent package in sys.modules.
+            portions = []
+            for entry in locations:
+                if not os.path.isdir(entry):
+                    continue
+                spec = machinery.FileFinder(entry, *LOADERS).find_spec(fullname)
+                if spec is None:
+                    continue
+                if spec.loader is None and spec.submodule_search_locations:
+                    portions.extend(spec.submodule_search_locations)  # namespace portion
+                    continue
+                return True, spec.submodule_search_locations
+            return bool(portions), (portions or None)
+
+        def locate(mod):
+            parts = mod.split(".")
+            spec = importlib.util.find_spec(parts[0])
+            if spec is None:
+                return f"No module named '{parts[0]}'"
+            locations = spec.submodule_search_locations
+            locations = list(locations) if locations is not None else None
+            name = parts[0]
+            for part in parts[1:]:
+                if locations is None:
+                    return f"'{name}' is not a package, so '{mod}' cannot be imported"
+                name = f"{name}.{part}"
+                found, locations = child(name, locations)
+                if not found:
+                    return f"No module named '{name}'"
+                locations = list(locations) if locations is not None else None
+            return None
 
         results = {}
-        warns = {}
-        for mod in modules:
-            top = mod.split(".")[0]
-            if "." in mod:
-                spec = importlib.util.find_spec(mod)
-                if spec is not None:
-                    results[mod] = None
-                    continue
+        for mod in json.loads(sys.argv[1]):
+            try:
+                results[mod] = locate(mod)
+            except Exception as exc:  # one broken module must not stop the batch
+                results[mod] = f"{type(exc).__name__}: {exc}"
 
-            if top in pkg_map and mod == top:
-                results[mod] = None
-                continue
-
-            # Fallback: actual import for packages not in metadata map
-            with warnings.catch_warnings(record=True) as caught:
-                warnings.simplefilter("always")
-                try:
-                    importlib.import_module(mod)
-                    results[mod] = None
-                except ImportError as e:
-                    results[mod] = str(e)
-                except Exception as e:
-                    results[mod] = f"{type(e).__name__}: {e}"
-            if caught:
-                warns[mod] = [
-                    f"{w.category.__name__}: {w.message}"
-                    for w in caught
-                    if issubclass(w.category, DeprecationWarning)
-                ]
-
-        print(json.dumps({"results": results, "warnings": warns}))
+        print(json.dumps({"results": results, "warnings": {}}))
     """)
 
-    result = subprocess.run(
-        [venv_python, "-c", check_script, json.dumps(sorted(modules))],
-        capture_output=True, text=True, timeout=120,
+    result = _run_isolated(
+        venv_python, check_script, json.dumps(sorted(modules)),
+        json.dumps(site_dirs(venv_python)), timeout=120,
     )
 
     if result.returncode == 0 and result.stdout.strip():

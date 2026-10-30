@@ -7,6 +7,8 @@ import re
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
+    from packaging.version import Version
+
     from depfresh.models import PackageChange, Vulnerability
 
 log = logging.getLogger("depfresh")
@@ -15,6 +17,143 @@ log = logging.getLogger("depfresh")
 def normalise(name: str) -> str:
     """Normalise a Python package name (PEP 503)."""
     return re.sub(r"[-_.]+", "-", name).lower()
+
+
+#: First release component at or above which a version is treated as a
+#: calendar version (certifi 2026.10.19, pytz 2026.1, tzdata 2025.3).  Moving
+#: between years is a data refresh, not an API break.
+CALVER_MIN_MAJOR = 1900
+
+
+def is_calver(version: str) -> bool:
+    """True for calendar versions such as ``2026.10.19`` (major >= 1900)."""
+    m = re.match(r"^(\d+)", version)
+    return m is not None and int(m.group(1)) >= CALVER_MIN_MAJOR
+
+
+def classify_bump(old: str, new: str) -> str:
+    """Classify a version change for reports and the major-upgrade policy.
+
+    Returns one of ``"same"``, ``"patch"``, ``"minor"``, ``"0.x-minor"`` (a
+    minor bump of a 0.x release, which may break), ``"major"``, ``"calver"``
+    (between calendar versions), ``"downgrade"``, ``"new"``/``"removed"``
+    (when one side is missing) or ``"unknown"`` when a version does not parse.
+    """
+    from packaging.version import InvalidVersion, Version
+
+    if not old or old == "(new)":
+        return "new"
+    if not new or new == "(removed)":
+        return "removed"
+    try:
+        a, b = Version(old), Version(new)
+    except InvalidVersion:
+        return "unknown"
+    if a == b:
+        return "same"
+    if b < a:
+        return "downgrade"
+    if is_calver(old) and is_calver(new):
+        return "calver"
+    if b.major > a.major:
+        return "major"
+    if b.minor > a.minor:
+        return "0.x-minor" if a.major == 0 else "minor"
+    return "patch"
+
+
+def admit_version(specifier: str, target: str) -> str:
+    """Rewrite a PEP 440 *specifier* so that it admits *target* as its floor.
+
+    Used to raise a floor for a security fix while keeping the rest of the
+    user's intent.  Upper bounds are never dropped: a bound that excludes
+    *target* is lifted only as far as *target* needs, at the bound's own
+    granularity, epochs included.
+
+    * an exact pin (``==X``/``===X``) becomes ``==target``;
+    * floors (``>=``, ``>``) give way to ``>=target``;
+    * ``~=X.Y.Z`` (``>=X.Y.Z, ==X.Y.*``) becomes ``~=target`` when *target*
+      has as many release components, ``>=target,==<prefix>.*`` otherwise,
+      with the prefix taken from *target*;
+    * a wildcard ``==X.Y.*`` is kept, or moved to *target*'s ``X.Y``;
+    * ``<V`` and ``<=V`` that admit *target* are kept; otherwise ``<V`` moves
+      to the next value after *target* with as many components as ``V``
+      (``<6.22`` → ``<6.26`` for 6.25.0, ``<47`` → ``<51`` for 50.0.2) and
+      ``<=V`` becomes ``<=target``;
+    * ``!=`` exclusions are kept unless they exclude *target*;
+    * a specifier with no floor gains ``>=target``.
+
+    Examples::
+
+        admit_version("==2.6.3", "2.8.0")        -> "==2.8.0"
+        admit_version(">=2.10.0", "3.17.1")      -> ">=3.17.1"
+        admit_version(">=6.21,<7", "6.25.0")     -> ">=6.25.0,<7"
+        admit_version(">=6.21,<6.22", "6.25.0")  -> ">=6.25.0,<6.26"
+        admit_version(">=41,<47", "50.0.2")      -> ">=50.0.2,<51"
+        admit_version("~=2.31.0", "2.32.1")      -> "~=2.32.1"
+        admit_version("==2.31.*", "2.32.1")      -> ">=2.32.1,==2.32.*"
+        admit_version("", "2.8.0")               -> ">=2.8.0"
+    """
+    from packaging.specifiers import InvalidSpecifier, Specifier
+    from packaging.version import InvalidVersion, Version
+
+    tv = Version(target)
+    floor = f">={target}"
+    kept: list[str] = []
+    for clause in (c.strip() for c in specifier.split(",") if c.strip()):
+        try:
+            spec = Specifier(clause)
+            op, ver = spec.operator, spec.version
+            if op in ("==", "===") and not ver.endswith(".*"):
+                return f"=={target}"
+            if op in (">=", ">"):
+                continue
+            if op == "~=":
+                width = len(Version(ver).release)
+                if width == len(tv.release) and tv.local is None:
+                    floor = ""
+                    kept.append(f"~={target}")
+                else:
+                    kept.append(f"=={_prefix(tv, width - 1)}.*")
+            elif op in ("==", "!=") and ver.endswith(".*"):
+                if op == "!=":
+                    if spec.contains(tv, prereleases=True):
+                        kept.append(clause)
+                elif spec.contains(tv, prereleases=True):
+                    kept.append(clause)
+                else:
+                    kept.append(f"=={_prefix(tv, len(Version(ver[:-2]).release))}.*")
+            elif spec.contains(tv, prereleases=True):
+                kept.append(clause)
+            elif op == "<":
+                kept.append(f"<{_next_after(tv, len(Version(ver).release))}")
+            elif op == "<=":
+                kept.append(f"<={target}")
+            # "!=target" excludes the fix itself: dropped.
+        except (InvalidSpecifier, InvalidVersion):
+            kept.append(clause)
+    out = [floor] if floor else []
+    for clause in kept:
+        if clause not in out:
+            out.append(clause)
+    return ",".join(out)
+
+
+def _epoch(version: Version) -> str:
+    return f"{version.epoch}!" if version.epoch else ""
+
+
+def _prefix(version: Version, width: int) -> str:
+    """The first *width* release components of *version* (zero-padded), with its epoch."""
+    release = [*version.release[:width], *([0] * max(0, width - len(version.release)))]
+    return _epoch(version) + ".".join(str(part) for part in release)
+
+
+def _next_after(version: Version, width: int) -> str:
+    """The smallest *width*-component version above *version*: ``2.32.1``, 2 → ``2.33``."""
+    release = [*version.release[:width], *([0] * max(0, width - len(version.release)))]
+    release[-1] += 1
+    return _epoch(version) + ".".join(str(part) for part in release)
 
 
 def build_constraints(

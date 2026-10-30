@@ -77,6 +77,28 @@ class TestExitCodes:
         with patch("depfresh.cli.upgrade", return_value=result):
             main(["/some/path"])  # must not raise
 
+    def test_import_regressions_exit_3(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = _make_result(
+            import_regressions={"fastmcp.tools.tool": "No module named 'fastmcp.tools.tool'"},
+        )
+        with patch("depfresh.cli.upgrade", return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/some/path"])
+        assert exc_info.value.code == 3
+        out = capsys.readouterr().out
+        assert "fastmcp.tools.tool" in out
+        assert "not written" in out
+
+    def test_import_regressions_take_precedence_over_remaining_vulns(self) -> None:
+        from depfresh.models import Vulnerability
+
+        vuln = Vulnerability("foo", "1.0", "CVE-2024-1234", "2.0", "bad")
+        result = _make_result(post_audit_vulns=[vuln], import_regressions={"foo.bar": "gone"})
+        with patch("depfresh.cli.upgrade", return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/some/path"])
+        assert exc_info.value.code == 3
+
     def test_remaining_vulns_exits_2(self) -> None:
         from depfresh.models import Vulnerability
 
@@ -330,3 +352,137 @@ class TestLogging:
         _setup_logging(verbose=False)
         logger = logging.getLogger("depfresh")
         assert logger.level == logging.INFO
+
+
+class TestNewFlags:
+    def _run(self, argv: list[str]) -> MagicMock:
+        mock_upgrade = MagicMock(return_value=_make_result())
+        with patch("depfresh.cli.upgrade", mock_upgrade):
+            try:
+                main(argv)
+            except SystemExit:
+                pass
+        return mock_upgrade
+
+    def test_defaults(self) -> None:
+        kwargs = self._run(["/p"]).call_args.kwargs
+        assert kwargs["strategy"] == "minimal"
+        assert kwargs["platform"] == "x86_64-unknown-linux-gnu"
+        assert kwargs["extras"] is None
+        assert kwargs["groups"] is None
+        assert kwargs["import_check"] is True
+        assert kwargs["repo_advisories"] is False
+        assert kwargs["uv_binary"] is None
+
+    def test_flags_reach_upgrade(self) -> None:
+        kwargs = self._run([
+            "/p", "--strategy", "latest", "--platform", "aarch64-unknown-linux-gnu",
+            "--extra", "full", "--extra", "gcs", "--group", "prod", "--all-extras",
+            "--all-groups", "--skip-import-check", "--repo-advisories", "--uv", "/opt/uv",
+        ]).call_args.kwargs
+        assert kwargs["strategy"] == "latest"
+        assert kwargs["platform"] == "aarch64-unknown-linux-gnu"
+        assert kwargs["extras"] == ["full", "gcs"]
+        assert kwargs["groups"] == ["prod"]
+        assert kwargs["all_extras"] is True and kwargs["all_groups"] is True
+        assert kwargs["import_check"] is False
+        assert kwargs["repo_advisories"] is True
+        assert kwargs["uv_binary"] == "/opt/uv"
+
+    def test_audit_only_calls_audit_only(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from depfresh.models import PlannedFix, Vulnerability
+
+        result = _make_result(
+            pre_audit_vulns=[Vulnerability("idna", "3.6", "CVE-1", "3.7", "")],
+            fixes=[PlannedFix("idna", "3.6", "3.7", "planned", "minor", "Upgrade to 3.7")],
+        )
+        with patch("depfresh.cli.audit_only", return_value=result) as mock:
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/p", "--audit-only", "--extra", "gcs"])
+        assert exc_info.value.code == 2
+        assert mock.call_args.kwargs["extras"] == ["gcs"]
+        assert "idna 3.6 -> 3.7 [planned]" in capsys.readouterr().out
+
+    def test_strategy_choices(self) -> None:
+        with pytest.raises(SystemExit) as exc_info:
+            main(["/p", "--strategy", "everything"])
+        assert exc_info.value.code == 2
+
+
+
+class TestNothingWritten:
+    """A withheld write-back is never reported as clean."""
+
+    def test_withheld_write_back_exits_2(self, capsys: pytest.CaptureFixture[str]) -> None:
+        from depfresh.models import Vulnerability
+
+        result = _make_result(
+            pre_audit_vulns=[Vulnerability("fastmcp", "3.4.2", "GHSA-x", "3.4.10", "")],
+            post_audit_vulns=[],
+            files_changed=["uv.lock"],
+            write_back_skipped="uv lock --check failed: stale",
+        )
+        with patch("depfresh.cli.upgrade", return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/p"])
+        assert exc_info.value.code == 2
+        out = capsys.readouterr().out
+        assert "NOTHING WAS WRITTEN: uv lock --check failed: stale." in out
+        assert "All vulnerabilities resolved" not in out
+
+    def test_dry_run_with_vulnerabilities_on_disk_exits_2(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        from depfresh.models import Vulnerability
+
+        result = _make_result(
+            dry_run=True, files_changed=["requirements.txt"],
+            pre_audit_vulns=[Vulnerability("idna", "3.6", "CVE-1", "3.7", "")],
+        )
+        with patch("depfresh.cli.upgrade", return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/p", "--dry-run"])
+        assert exc_info.value.code == 2
+        assert "DRY RUN: nothing was written" in capsys.readouterr().out
+
+    def test_unaudited_packages_never_read_as_clean(
+        self, capsys: pytest.CaptureFixture[str],
+    ) -> None:
+        result = _make_result(
+            audited_count=40, not_audited=["private-widget==0.1.0 (private index x)"],
+        )
+        with patch("depfresh.cli.upgrade", return_value=result):
+            main(["/p"])  # exit 0: no known vulnerabilities in what was audited
+        out = capsys.readouterr().out
+        assert "Audited:      40 packages; 1 not audited" in out
+        assert "No known vulnerabilities in the 40 audited packages; 1 shipped" in out
+        assert "All vulnerabilities resolved" not in out
+
+    @pytest.mark.parametrize("audit", [False, True])
+    def test_nothing_audited_exits_2(
+        self, capsys: pytest.CaptureFixture[str], audit: bool,
+    ) -> None:
+        result = _make_result(
+            audited_count=0, not_audited=["private-widget==0.1.0 (private index x)"],
+        )
+        target = "depfresh.cli.audit_only" if audit else "depfresh.cli.upgrade"
+        with patch(target, return_value=result):
+            with pytest.raises(SystemExit) as exc_info:
+                main(["/p", "--audit-only"] if audit else ["/p"])
+        assert exc_info.value.code == 2
+        assert "NOTHING WAS AUDITED" in capsys.readouterr().out
+
+    def test_other_index_is_named(self, capsys: pytest.CaptureFixture[str]) -> None:
+        result = _make_result(audited_count=2, other_index={
+            "six": "https://mirror.example/simple", "idna": "https://mirror.example/simple",
+        })
+        with patch("depfresh.cli.upgrade", return_value=result):
+            main(["/p"])
+        out = capsys.readouterr().out
+        assert "Other index:  2 audited packages come from https://mirror.example/simple" in out
+        assert "All vulnerabilities resolved!" in out
+
+    def test_clean_dry_run_exits_0(self) -> None:
+        result = _make_result(dry_run=True)
+        with patch("depfresh.cli.upgrade", return_value=result):
+            main(["/p", "--dry-run"])  # must not raise

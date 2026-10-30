@@ -11,13 +11,20 @@ A Python dependency upgrade and security audit tool. It combines **uv** (fast pa
 ```
 src/depfresh/          # Source code
   cli.py               # CLI entry point (argparse)
-  upgrade.py           # Core orchestration + public API
-  parsers.py           # Format-aware dependency parsing (6 formats)
-  models.py            # Dataclasses (Vulnerability, PackageChange, UpgradeResult, etc.)
-  constraints.py       # Version constraint building, PEP 503 normalization, remaining vuln diagnostics
-  uv.py                # uv binary discovery & venv management
-  audit.py             # pip-audit integration
-  verify.py            # AST-based import verification
+  upgrade.py           # Orchestration + public API (dispatches lock / resolved / legacy modes)
+  lockmode.py          # Lock-aware mode: uv export, uv lock --upgrade-package, uv lock --check
+  pipmode.py           # Resolved mode: uv pip compile for the deploy platform, line-preserving edits
+  remediation.py       # Shared minimal-mode pieces: options, auditor, import gate, result rows
+  advisories.py        # Fix planning from OSV ranges + PyPI releases; deploy-target markers
+  repoadvisories.py    # Opt-in GitHub repository advisories (gh api)
+  indexes.py           # Private-index detection and refusals
+  parsers/             # Format-aware dependency parsing (7 formats, setup.py read statically)
+  models.py            # Dataclasses (Vulnerability, PlannedFix, UpgradeResult, etc.)
+  constraints.py       # Version constraints, bump classification, PEP 503 normalization
+  uv.py                # uv discovery (minimum version), venv management, subprocess helper
+  audit.py             # Isolated, pinned pip-audit; alias dedupe
+  verify.py            # AST-based import verification (no imports executed)
+  textio.py            # UTF-8/UTF-16 aware reading, line-ending-preserving atomic writes
   reports.py           # Log/markdown report generation
   exceptions.py        # Custom exceptions
 tests/                 # pytest test suite (mirrors src modules)
@@ -32,7 +39,7 @@ uv venv && source .venv/bin/activate
 uv pip install -e ".[dev]"
 ```
 
-Runtime requires the `uv` binary installed separately. Dev extras include pytest, ruff, and mypy.
+Runtime requires a `uv` binary of at least 0.9.0 installed separately (`--uv` or `DEPFRESH_UV` to pick one). Dev extras include pytest, ruff, and mypy.
 
 ## Commands
 
@@ -76,30 +83,37 @@ python -m build
 
 ## Supported dependency formats
 
-| Format | File | Detection order |
-|--------|------|-----------------|
-| Simple requirements | `requirements.txt` | 1st |
-| Pip-compile (hashed) | `requirements.txt` | 1st (auto) |
-| Requirements input | `requirements.in` | 2nd |
-| PEP 621 | `pyproject.toml` | 3rd |
-| Poetry | `pyproject.toml` | 3rd |
-| Pipfile | `Pipfile` | 4th |
+| Format | File | Minimal strategy |
+|--------|------|------------------|
+| uv project | `pyproject.toml` + `uv.lock` | lock-aware (`lockmode.py`) |
+| Simple / hashed requirements | `requirements.txt` | resolved (`pipmode.py`) |
+| Requirements input | `requirements.in` | resolved |
+| PEP 621 | `pyproject.toml` | resolved |
+| setup.py (static, read-only) | `setup.py` | resolved, never written |
+| Poetry | `pyproject.toml` | `--strategy latest` only |
+| Pipfile | `Pipfile` | `--strategy latest` only |
+
+Auto-detection (`parsers.choose_dep_file`): `pyproject.toml` when `uv.lock` exists, then what a local Dockerfile installs, then `requirements.txt` → `requirements.in` → `pyproject.toml` → `Pipfile`.
 
 ## CLI usage
 
 ```bash
 depfresh /path/to/project
+depfresh /path/to/project --audit-only
 depfresh /path/to/project --dry-run
 depfresh /path/to/project --allow-major urllib3 cryptography
 depfresh /path/to/project --keep-version crewai litellm
-depfresh /path/to/project --python 3.12 --reports-dir ./artifacts
+depfresh /path/to/project --python 3.12 --extra full --reports-dir ./artifacts
+depfresh /path/to/project --strategy latest
 ```
 
-Exit codes: `0` = clean, `1` = error, `2` = vulnerabilities remain.
+Exit codes: `0` = no known vulnerabilities in what was audited, `1` = error, `2` = vulnerabilities remain, nothing was written, or nothing could be audited, `3` = imports regressed (nothing written). Only packages pinned to an index (`[tool.uv.sources]`) or served by an explicit index are private (`indexes.PrivateScope`); everything else is audited by name.
+
+Never execute repository code (no `setup.py`, no building local paths) and never resolve a private-index package against public PyPI.
 
 ## Remaining vulnerability diagnostics
 
-When vulnerabilities remain after upgrade, `diagnose_remaining()` in `constraints.py` classifies each one:
+In the minimal modes each remaining advisory carries the reason from its fix plan (`advisories.plan_fixes` → `remediation.remaining_reasons`): needs `--allow-major`, kept, no fix released, private index, or the uv error that blocked it. Advisories are planned one by one: `FixPlan.open_advisories` holds the ones the target leaves open, each with its own reason, so they never block the package's other fixes. With `--strategy latest`, `diagnose_remaining()` in `constraints.py` classifies each one:
 - **Major upgrade required** — fix crosses a major version boundary (default constraints cap at `<major+1.0`)
 - **Pinned via --keep-version** — user explicitly pinned the package
 - **Major allowed but unresolved** — major was permitted but uv hit a transitive conflict
