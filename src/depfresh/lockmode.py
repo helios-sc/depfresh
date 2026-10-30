@@ -245,7 +245,7 @@ class LockProject:
         self.root = work_dir / "project"
         self.commands: list[str] = []
         pyproject = tomllib.loads((target_dir / "pyproject.toml").read_text(encoding="utf-8"))
-        _check_static_dependencies(pyproject, target_dir / "pyproject.toml")
+        check_static_dependencies(pyproject, target_dir / "pyproject.toml")
         if _needs_full_copy(pyproject):
             self._check_paths_inside(pyproject)
             shutil.copytree(target_dir, self.root, ignore=_COPY_IGNORE, symlinks=True)
@@ -325,7 +325,7 @@ class LockProject:
         return self.root / "pyproject.toml"
 
 
-def _check_static_dependencies(pyproject: dict[str, Any], path: Path) -> None:
+def check_static_dependencies(pyproject: dict[str, Any], path: Path) -> None:
     """Refuse projects whose dependencies only a build backend can compute.
 
     uv would run the build backend (repository code, e.g. ``setup.py``) to

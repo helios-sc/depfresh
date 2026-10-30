@@ -30,6 +30,7 @@ from depfresh.parsers._requirements import (
     RequirementsSimpleHandler,
     _merge_continuation_lines,
 )
+from depfresh.parsers._setup_py import SetupPyError, SetupPyHandler, read_setup_py
 from depfresh.textio import UnreadableTextError, read_text
 
 log = logging.getLogger("depfresh")
@@ -47,6 +48,16 @@ def detect_format(path: Path) -> DependencyFormat:
 
     if name == "pipfile":
         return DependencyFormat.PIPFILE
+
+    if name == "setup.py":
+        # read statically, never executed (see parsers._setup_py)
+        return DependencyFormat.SETUP_PY
+
+    if name == "setup.cfg":
+        raise ValueError(
+            f"{path}: setup.cfg is not supported; uv would run the build backend to read it. "
+            "Point depfresh at pyproject.toml or a requirements file."
+        )
 
     if name == "requirements.in":
         return DependencyFormat.REQUIREMENTS_IN
@@ -234,6 +245,7 @@ def get_handler(fmt: DependencyFormat) -> FormatHandler:
         DependencyFormat.PYPROJECT_PEP621: PyprojectPEP621Handler(),
         DependencyFormat.PYPROJECT_POETRY: PyprojectPoetryHandler(),
         DependencyFormat.PIPFILE: PipfileHandler(),
+        DependencyFormat.SETUP_PY: SetupPyHandler(),
     }
     return handlers[fmt]
 
@@ -247,6 +259,9 @@ __all__ = [
     "PyprojectPEP621Handler",
     "PyprojectPoetryHandler",
     "PipfileHandler",
+    "SetupPyHandler",
+    "SetupPyError",
+    "read_setup_py",
     "detect_format",
     "detect_dep_file",
     "choose_dep_file",

@@ -230,6 +230,13 @@ def _inspect_requirements_file(path: Path) -> DependencyInspection:
         base = stripped.split(" --hash=", 1)[0].strip()
         if not base or base.startswith("--hash="):
             continue
+        if _looks_like_path_or_url(base):
+            # uv would build a local path or download an archive: never silently
+            inspection.direct_references.append(DependencySpec(
+                name="", version="", requirement="", raw=base,
+                source_kind="direct-reference", group="runtime", is_runtime=True,
+            ))
+            continue
         try:
             req = Requirement(base)
         except InvalidRequirement:
@@ -245,6 +252,22 @@ def _inspect_requirements_file(path: Path) -> DependencyInspection:
         else:
             inspection.registry.append(dep)
     return inspection
+
+
+_ARCHIVE_SUFFIXES = (".whl", ".tar.gz", ".tgz", ".zip", ".tar.bz2")
+
+
+def _looks_like_path_or_url(line: str) -> bool:
+    """Requirement lines that name a path, an archive or a URL instead of a project."""
+    first = line.split(";", 1)[0].split(" #", 1)[0].strip()
+    if " @ " in first or first.startswith(("git+", "hg+", "svn+", "bzr+")):
+        return False  # PEP 508 direct references are classified by packaging
+    return (
+        first.startswith((".", "/", "~", "file:", "\\"))
+        or "://" in first
+        or first.endswith(_ARCHIVE_SUFFIXES)
+        or (len(first) > 2 and first[1] == ":" and first[2] in "\\/")
+    )
 
 
 def _warn_pip_directive(line: str, path: Path) -> None:

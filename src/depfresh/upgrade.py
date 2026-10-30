@@ -26,11 +26,18 @@ from depfresh.exceptions import (
     RequirementsNotFoundError,
     TargetNotFoundError,
 )
+from depfresh.indexes import (
+    PrivateSourceError,
+    check_requirements_against_sources,
+    foreign_sources,
+    uv_source_indexes,
+)
 from depfresh.lockmode import LockOutcome, remediate_lock
 from depfresh.models import DependencyScope, DependencySpec, UpgradeResult, Vulnerability
 from depfresh.parsers import (
     DependencyFormat,
     FormatHandler,
+    SetupPyHandler,
     choose_dep_file,
     detect_format,
     get_handler,
@@ -514,17 +521,26 @@ def _upgrade_latest(
 
     # Render the write-back on a copy first: the report shows exactly what
     # changes (or would change) in the dependency file, dry run or not.
-    new_content = _render_write(
-        ctx.handler,
-        new_pkgs,
-        ctx.req_path,
-        uv=ctx.uv,
-        python_version=python,
-        dependency_scope=dependency_scope,
-    )
+    if ctx.dep_format == DependencyFormat.SETUP_PY:
+        new_content = ctx.req_path.read_bytes()
+        result.write_back_skipped = "setup.py is never edited"
+        result.notes.append(
+            "setup.py was read statically (ast): depfresh never executes or edits it."
+        )
+    else:
+        new_content = _render_write(
+            ctx.handler,
+            new_pkgs,
+            ctx.req_path,
+            uv=ctx.uv,
+            python_version=python,
+            dependency_scope=dependency_scope,
+        )
     result.manifest_diff = manifest_diff(ctx.req_path, new_content)
 
-    if result.import_regressions:
+    if result.write_back_skipped:
+        log.error("NOT writing %s: %s", ctx.req_path.name, result.write_back_skipped)
+    elif result.import_regressions:
         result.write_back_skipped = (
             f"{len(result.import_regressions)} import(s) resolved before the upgrade "
             "and fail after it"
@@ -918,6 +934,50 @@ def _pip_result(
     return result
 
 
+def _check_private_sources(manifest: _Manifest) -> None:
+    """Requirements files cannot pin a package to the private index uv.sources names."""
+    if manifest.fmt in (
+        DependencyFormat.REQUIREMENTS_SIMPLE,
+        DependencyFormat.REQUIREMENTS_HASHED,
+        DependencyFormat.REQUIREMENTS_IN,
+        DependencyFormat.SETUP_PY,
+    ):
+        listed = set(manifest.handler.parse(manifest.path))
+        check_requirements_against_sources(listed, manifest.target_dir, manifest.path.name)
+
+
+def _check_latest_sources(manifest: _Manifest) -> None:
+    """The latest strategy installs a synthesized file: it cannot honour private indexes."""
+    if manifest.fmt == DependencyFormat.PYPROJECT_PEP621:
+        pinned = uv_source_indexes(manifest.path)
+        if pinned:
+            raise PrivateSourceError(
+                f"{manifest.path.name} pins {', '.join(sorted(pinned))} to a private index "
+                "([tool.uv.sources]); --strategy latest installs a synthesized requirements "
+                "file that cannot honour it and would look the names up on public PyPI. "
+                "Use the default minimal strategy, which runs uv on the project itself."
+            )
+    elif manifest.fmt in (DependencyFormat.PYPROJECT_POETRY, DependencyFormat.PIPFILE):
+        foreign = foreign_sources(manifest.path)
+        if foreign:
+            raise PrivateSourceError(
+                f"{manifest.path.name} declares package sources other than PyPI "
+                f"({', '.join(foreign)}); depfresh cannot honour them for this format and "
+                "will not resolve those packages against public PyPI."
+            )
+    else:
+        _check_private_sources(manifest)
+
+
+def _setup_py_manifest(manifest: _Manifest, work_dir: Path, options: RemediationOptions) -> Path:
+    """Write setup.py's static requirements to a scratch requirements file for uv."""
+    handler = manifest.handler
+    assert isinstance(handler, SetupPyHandler)
+    path = work_dir / "setup.py.requirements.in"
+    path.write_text(handler.requirements_text(manifest.path, options.all_extras))
+    return path
+
+
 def _run_pip_mode(
     manifest: _Manifest,
     options: RemediationOptions,
@@ -940,11 +1000,13 @@ def _run_pip_mode(
         audit_python, pip_audit_version = install_pip_audit(
             uv, work_dir / ".pip-audit-tool", options.env.python_minor,
         )
+        is_setup_py = manifest.fmt == DependencyFormat.SETUP_PY
         outcome = remediate_pip(
             uv=uv,
             target_dir=manifest.target_dir,
-            manifest=manifest.path,
-            fmt=manifest.fmt,
+            manifest=_setup_py_manifest(manifest, work_dir, options) if is_setup_py
+            else manifest.path,
+            fmt=DependencyFormat.REQUIREMENTS_IN if is_setup_py else manifest.fmt,
             work_dir=work_dir,
             auditor=Auditor(audit_python, work_dir),
             options=options,
@@ -962,6 +1024,16 @@ def _run_pip_mode(
         venv_name=venv_name, dependency_scope=dependency_scope,
         ignore_direct_references=ignore_direct_references, audit_only_run=audit_only_run,
     )
+    if manifest.fmt == DependencyFormat.SETUP_PY:
+        result.requirements_path = "setup.py"
+        result.files_changed = []
+        result.manifest_diff = ""
+        result.notes.insert(0, (
+            "setup.py was read statically (ast): depfresh never executes or edits it. "
+            "Apply the versions under Security Fixes to install_requires by hand."
+        ))
+        if not audit_only_run and outcome.changed:
+            result.write_back_skipped = "setup.py is never edited"
     if audit_only_run:
         return result
     if result.write_back_skipped:
@@ -1113,16 +1185,18 @@ def upgrade(
         return result
 
     if strategy == "minimal":
-        if manifest.fmt in PIP_FORMATS:
-            # Validate the inputs before looking for uv: fail closed on direct references.
+        if manifest.fmt in (*PIP_FORMATS, DependencyFormat.SETUP_PY):
+            # Validate the inputs before looking for uv: fail closed on direct references
+            # and on packages a requirements file cannot pin to their private index.
             _select_dependencies(
                 manifest.handler, manifest.path, dependency_scope=dependency_scope,
                 ignore_direct_references=ignore_direct_references,
             )
-        if manifest.fmt not in PIP_FORMATS:
+            _check_private_sources(manifest)
+        if manifest.fmt not in (*PIP_FORMATS, DependencyFormat.SETUP_PY):
             raise DepfreshError(
-                f"The minimal strategy supports requirements files and PEP 621 pyproject.toml "
-                f"(with or without uv.lock), not {manifest.fmt.value}. Re-run with "
+                f"The minimal strategy supports requirements files, PEP 621 pyproject.toml "
+                f"(with or without uv.lock) and setup.py, not {manifest.fmt.value}. Re-run with "
                 "--strategy latest to upgrade every package within its bounds."
             )
         service_label = label or derive_label(target_dir)
@@ -1141,6 +1215,7 @@ def upgrade(
         _write_reports(result, _out_dir(reports_dir, service_label), result.date)
         return result
 
+    _check_latest_sources(manifest)
     return _upgrade_latest(
         target_dir,
         label=label,
@@ -1197,7 +1272,8 @@ def audit_only(
             venv_name=venv_name, dependency_scope=dependency_scope, sources=sources,
             audit_only_run=True,
         )
-    if manifest.fmt in PIP_FORMATS:
+    if manifest.fmt in (*PIP_FORMATS, DependencyFormat.SETUP_PY):
+        _check_private_sources(manifest)
         options = _options(
             python=python, platform=platform, allow_major=None, keep_version=None,
             dry_run=True, import_check=False, extras=extras, all_extras=all_extras,
@@ -1210,6 +1286,7 @@ def audit_only(
             ignore_direct_references=ignore_direct_references, sources=sources,
             audit_only_run=True,
         )
+    _check_latest_sources(manifest)
     return _audit_only_legacy(
         target_dir,
         dep_file=dep_file or str(manifest.path.relative_to(target_dir)),

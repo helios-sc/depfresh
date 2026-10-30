@@ -45,7 +45,7 @@ from depfresh.exceptions import (
     DirectReferenceError,
     PrivateIndexError,
 )
-from depfresh.lockmode import is_pypi_index
+from depfresh.lockmode import check_static_dependencies, is_pypi_index
 from depfresh.models import ImportCheck, PackageChange, Vulnerability
 from depfresh.parsers import DependencyFormat
 from depfresh.remediation import (
@@ -609,6 +609,9 @@ def remediate_pip(
     audit_only: bool = False,
 ) -> PipOutcome:
     """Audit and (unless *audit_only*) remediate a build-time-resolved manifest."""
+    if fmt == DependencyFormat.PYPROJECT_PEP621:
+        check_static_dependencies(tomlkit.parse(manifest.read_text(encoding="utf-8")).unwrap(),
+                                  manifest)
     ws = PipWorkspace(uv, target_dir, manifest, fmt, work_dir, options, ignore_direct_references)
     original = ws.original.text
     doc = open_document(fmt, original, options)

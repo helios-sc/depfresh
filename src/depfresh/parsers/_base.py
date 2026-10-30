@@ -23,6 +23,7 @@ class DependencyFormat(str, Enum):
     PYPROJECT_PEP621 = "pyproject-pep621"
     PYPROJECT_POETRY = "pyproject-poetry"
     PIPFILE = "pipfile"
+    SETUP_PY = "setup-py"
 
 
 # ---------------------------------------------------------------------------
