@@ -123,7 +123,7 @@ class TestRecordAffects:
 
 class TestPlanFixes:
     def test_in_major_fix_beats_pip_audit_fix_versions(self) -> None:
-        """enterprise: pip-audit says fastmcp -> 4.1.2; OSV also fixes 3.4.10."""
+        """pip-audit says fastmcp -> 4.1.2; OSV also fixes 3.4.10."""
         sources = FakeSources(
             records={"fastmcp": [_record(
                 "GHSA-7xgj-8392-5q4r", "fastmcp",

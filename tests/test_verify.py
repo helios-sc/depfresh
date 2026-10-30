@@ -125,10 +125,10 @@ class TestFindLocalModules:
     def test_finds_modules_below_the_first_level(self, tmp_path: Path) -> None:
         """A project that puts src/ on sys.path imports its modules by bare name."""
         (tmp_path / "src" / "ops").mkdir(parents=True)
-        (tmp_path / "src" / "bq_client.py").write_text("")
-        (tmp_path / "src" / "ops" / "commodity_geo_map.py").write_text("")
+        (tmp_path / "src" / "db_client.py").write_text("")
+        (tmp_path / "src" / "ops" / "geo_lookup.py").write_text("")
         local = _find_local_modules(tmp_path)
-        assert {"bq_client", "commodity_geo_map", "src", "ops"} <= local
+        assert {"db_client", "geo_lookup", "src", "ops"} <= local
 
     def test_ignores_modules_inside_virtualenvs(self, tmp_path: Path) -> None:
         site = tmp_path / ".venv" / "lib" / "python3.11" / "site-packages" / "requests"

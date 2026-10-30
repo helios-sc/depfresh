@@ -356,7 +356,7 @@ class TestRemediateLock:
     def test_upgrades_only_vulnerable_packages_and_their_co_upgrades(
         self, tmp_path: Path,
     ) -> None:
-        """enterprise: aiohttp 3.14.4 forces yarl 1.25.1; six is not touched."""
+        """aiohttp 3.14.4 forces yarl 1.25.1; six is not touched."""
         auditor = FakeAuditor({"aiohttp": {"3.14.1"}})
         sources = FakeSources({"aiohttp": "3.14.4"}, self.RELEASES)
         outcome, project = _run(
